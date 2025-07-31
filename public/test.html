@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Brave MCP Server Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .tool { border: 1px solid #ddd; margin: 10px 0; padding: 15px; border-radius: 5px; }
+        .result { background: #f0f0f0; padding: 10px; margin: 10px 0; border-radius: 3px; white-space: pre-wrap; }
+        .error { background: #ffe6e6; color: #d00; }
+        .success { background: #e6ffe6; color: #060; }
+        button { background: #007bff; color: white; border: none; padding: 8px 16px; border-radius: 3px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        input, textarea { width: 100%; padding: 5px; margin: 5px 0; }
+    </style>
+</head>
+<body>
+    <h1>🦁 Brave MCP Server Browser Test</h1>
+    <p>This page tests the Brave MCP Server from Claude Browser.</p>
+    
+    <div class="tool">
+        <h3>🌐 Test Tool List</h3>
+        <button onclick="listTools()">Get Available Tools</button>
+        <div id="tools-result" class="result"></div>
+    </div>
+    
+    <div class="tool">
+        <h3>🔍 Test Web Scraping</h3>
+        <input type="url" id="scrape-url" placeholder="https://example.com" value="https://example.com">
+        <br>
+        <button onclick="testScrape()">Scrape Website</button>
+        <div id="scrape-result" class="result"></div>
+    </div>
+    
+    <div class="tool">
+        <h3>🔎 Test Brave Search</h3>
+        <input type="text" id="search-query" placeholder="Search query" value="Claude AI">
+        <br>
+        <button onclick="testSearch()">Search with Brave</button>
+        <div id="search-result" class="result"></div>
+    </div>
+    
+    <div class="tool">
+        <h3>📸 Test Screenshot</h3>
+        <input type="url" id="screenshot-url" placeholder="https://example.com" value="https://example.com">
+        <br>
+        <button onclick="testScreenshot()">Take Screenshot</button>
+        <div id="screenshot-result" class="result"></div>
+    </div>
+
+    <script>
+        const API_BASE = 'https://localhost:3002';
+        
+        async function apiCall(endpoint, data = null) {
+            try {
+                const options = {
+                    method: data ? 'POST' : 'GET',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                };
+                
+                if (data) {
+                    options.body = JSON.stringify(data);
+                }
+                
+                const response = await fetch(`${API_BASE}${endpoint}`, options);
+                const result = await response.json();
+                
+                return { success: response.ok, data: result };
+            } catch (error) {
+                return { success: false, error: error.message };
+            }
+        }
+        
+        function displayResult(elementId, result) {
+            const element = document.getElementById(elementId);
+            if (result.success) {
+                element.className = 'result success';
+                element.textContent = JSON.stringify(result.data, null, 2);
+            } else {
+                element.className = 'result error';
+                element.textContent = `Error: ${result.error || result.data?.error}`;
+            }
+        }
+        
+        async function listTools() {
+            const result = await apiCall('/tools');
+            displayResult('tools-result', result);
+        }
+        
+        async function testScrape() {
+            const url = document.getElementById('scrape-url').value;
+            const result = await apiCall('/tools/brave_scrape', {
+                url: url,
+                screenshot: false
+            });
+            displayResult('scrape-result', result);
+        }
+        
+        async function testSearch() {
+            const query = document.getElementById('search-query').value;
+            const result = await apiCall('/tools/brave_search', {
+                query: query,
+                limit: 5
+            });
+            displayResult('search-result', result);
+        }
+        
+        async function testScreenshot() {
+            const url = document.getElementById('screenshot-url').value;
+            const result = await apiCall('/tools/brave_scrape', {
+                url: url,
+                screenshot: true
+            });
+            
+            if (result.success && result.data.result.screenshot) {
+                const element = document.getElementById('screenshot-result');
+                element.className = 'result success';
+                element.innerHTML = `<p>Screenshot taken successfully!</p><img src="${result.data.result.screenshot}" style="max-width: 100%; border: 1px solid #ddd;">`;
+            } else {
+                displayResult('screenshot-result', result);
+            }
+        }
+        
+        // Test server health on load
+        window.onload = async () => {
+            const health = await apiCall('/health');
+            if (health.success) {
+                console.log('✅ Server is healthy:', health.data);
+            } else {
+                console.error('❌ Server health check failed:', health.error);
+            }
+        };
+    </script>
+</body>
+</html>
