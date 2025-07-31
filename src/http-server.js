@@ -36,8 +36,8 @@ const simpleAuth = (req, res, next) => {
   next();
 };
 
-// OAuth endpoints for Claude Browser (simplified)
-app.post('/oauth/token', (req, res) => {
+// OAuth token endpoints - both /token and /oauth/token
+const tokenHandler = (req, res) => {
   console.log('🔐 OAuth token request:', req.body);
   
   // Accept any token request
@@ -47,9 +47,13 @@ app.post('/oauth/token', (req, res) => {
     expires_in: 86400,
     scope: 'read write'
   });
-});
+};
 
-app.get('/oauth/authorize', (req, res) => {
+app.post('/token', tokenHandler);
+app.post('/oauth/token', tokenHandler);
+
+// Both /authorize and /oauth/authorize for compatibility
+const authorizeHandler = (req, res) => {
   console.log('🔐 OAuth authorize request:', req.query);
   
   const { client_id, redirect_uri, response_type, state } = req.query;
@@ -65,7 +69,10 @@ app.get('/oauth/authorize', (req, res) => {
     error: 'unsupported_response_type',
     supported: ['code']
   });
-});
+};
+
+app.get('/authorize', authorizeHandler);
+app.get('/oauth/authorize', authorizeHandler);
 
 // OpenID Connect discovery endpoint (Claude might need this)
 app.get('/.well-known/openid_configuration', (req, res) => {
@@ -73,8 +80,8 @@ app.get('/.well-known/openid_configuration', (req, res) => {
   
   res.json({
     issuer: baseUrl,
-    authorization_endpoint: `${baseUrl}/oauth/authorize`,
-    token_endpoint: `${baseUrl}/oauth/token`,
+    authorization_endpoint: `${baseUrl}/authorize`,
+    token_endpoint: `${baseUrl}/token`,
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code'],
     token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic', 'none']
