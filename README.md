@@ -4,8 +4,8 @@ Egyszerű MCP szerver Brave böngésző automatizálásához.
 
 ## 👥 Contributors
 
-**🚀 Created by:** [Tamas54](https://github.com/Tamas54) & Claude Code  
-**💡 Concept & Implementation:** Tamás  
+**🚀 Created by:** [Tamas Csizmadia](https://github.com/Tamas54) & Claude Code  
+**💡 Concept & Implementation:** Tamas Csizmadia  
 **🤖 Development Assistant:** Claude Code
 
 ## Telepítés
@@ -79,17 +79,67 @@ node claude-test.js
 }
 ```
 
-### Claude Browser (HTTP API):
-Indítsd el a szervert HTTP módban:
+### Claude Browser (HTTP MCP Server):
+
+#### 🚀 Production (Railway):
+**Remote MCP Server URL:**
+```
+https://brave-mcp-server-production.up.railway.app/mcp
+```
+
+**OAuth beállítások:**
+- **Client ID:** `brave-mcp-client`
+- **Client Secret:** `brave-mcp-secret` (opcionális)
+
+#### 🏠 Local development:
 ```bash
 npm run http
 ```
 
-Aztán használd a HTTP API-t:
-- **Health check**: `GET http://localhost:3001/health`
-- **Tools lista**: `GET http://localhost:3001/tools`
-- **Tool végrehajtás**: `POST http://localhost:3001/tools/{toolName}`
-- **Teszt oldal**: `http://localhost:3001/static/test.html`
+**Local MCP Server URL:**
+```
+https://localhost:3002/mcp
+```
+
+**Note:** Lokálisan self-signed certificate-et használ - fogadd el a böngésző biztonsági figyelmeztetését.
+
+## 🚀 Deployment
+
+### Railway (Ajánlott)
+
+1. **Fork/Clone** a GitHub repository-t
+2. **Railway Dashboard** → "Deploy from GitHub"
+3. **Select** `Tamas54/brave-mcp-server`
+4. **Environment Variables:**
+   ```
+   HEADLESS=true
+   NODE_ENV=production
+   PORT=3000
+   ```
+5. **Deploy** - Railway automatikusan felismeri a Dockerfile-t
+
+**Production URL:** `https://[app-name].railway.app/mcp`
+
+### Docker
+
+```bash
+# Build
+docker build -t brave-mcp-server .
+
+# Run
+docker run -p 3000:3000 -e HEADLESS=true brave-mcp-server
+```
+
+### Manual Deployment
+
+```bash
+# Production setup
+npm ci --only=production
+export NODE_ENV=production
+export HEADLESS=true
+export HTTP_PORT=3000
+npm start
+```
 
 ## Használat
 
@@ -312,15 +362,97 @@ A bejelentkezési session-ök a `.sessions/` mappában tárolódnak. Ezek érzé
 rm -rf .sessions/
 ```
 
-## Teljes eszköz lista
+## 🛠️ Teljes MCP Tools Lista
 
-1. **brave_scrape** - Weboldal scrape-elés (markdown, HTML, screenshot)
-2. **brave_crawl** - Domain crawling több oldalon keresztül  
-3. **brave_search** - Keresés Brave Search-ben
-4. **brave_login** - Bejelentkezés weboldalakra (Gmail, Facebook, Twitter, LinkedIn, Instagram, custom)
-5. **brave_session_action** - Műveletek végrehajtása bejelentkezett session-nel
-6. **brave_list_sessions** - Aktív session-ök listázása
-7. **brave_clear_sessions** - Session-ök törlése
-8. **brave_visual_captcha** - CAPTCHA vizuális kezelése (screenshot, click, type)
-9. **brave_mouse_control** - Teljes egér kontroll (move, click, drag, hover)
-10. **brave_visual_inspect** - Vizuális elem felismerés és analízis
+### 🌐 Web Automation Tools
+
+#### 1. **brave_scrape** - Weboldal Scraping
+Weboldal tartalmának kinyerése Brave böngészővel
+- **Paraméterek:** `url` (kötelező), `waitForSelector`, `waitTime`, `screenshot`, `includeHtml`, `includeLinks`
+- **Visszaad:** markdown, text, html, metadata, links, screenshot
+- **Példa:** `Scrape-eld le a https://index.hu oldalt screenshot=true paraméterrel`
+
+#### 2. **brave_crawl** - Website Crawling  
+Több oldal bejárása ugyanazon domain-en
+- **Paraméterek:** `startUrl` (kötelező), `maxPages`, `sameDomain`, `includePattern`, `excludePattern`
+- **Visszaad:** Crawled pages array with content
+- **Példa:** `Crawl-old a https://example.com domain-t maxPages=5 paraméterrel`
+
+#### 3. **brave_search** - Brave Search
+Keresés a Brave keresőmotorban
+- **Paraméterek:** `query` (kötelező), `limit`
+- **Visszaad:** Search results with titles, URLs, descriptions
+- **Példa:** `Keress rá "MCP protocol" kifejezésre limit=10 paraméterrel`
+
+### 🔐 Authentication & Session Management
+
+#### 4. **brave_login** - Automated Login
+Bejelentkezés népszerű weboldalakra
+- **Támogatott oldalak:** Gmail, Facebook, Twitter, LinkedIn, Instagram, Custom sites
+- **Paraméterek:** `site`, `credentials` (username, password, totp), `saveSession`, `customUrl`
+- **Visszaad:** Login success status, session info
+- **Példa:** `Jelentkezz be Gmail-be site='gmail', credentials={username: 'email@gmail.com', password: 'pass'}`
+
+#### 5. **brave_session_action** - Session Operations
+Műveletek végrehajtása mentett session-nel
+- **Akciók:** `read_emails`, `send_email`, `get_messages`, `post_content`, `custom`
+- **Paraméterek:** `site`, `action`, `parameters`, `customScript`
+- **Példa:** `Olvass el emaileket: site='gmail', action='read_emails'`
+
+#### 6. **brave_list_sessions** - Session Management
+Aktív session-ök listázása és állapotuk
+- **Visszaad:** Sessions array with age, status, cookie count
+- **Példa:** `Listázd az aktív session-öket`
+
+#### 7. **brave_clear_sessions** - Session Cleanup
+Session-ök törlése
+- **Paraméterek:** `site` (vagy 'all' az összeshez)
+- **Példa:** `Töröld a Gmail session-t site='gmail' paraméterrel`
+
+### 🎮 Visual Control & Automation
+
+#### 8. **brave_visual_captcha** - CAPTCHA Solver
+Vizuális CAPTCHA kezelés screenshot alapján
+- **Akciók:** `capture` (screenshot), `click` (coordinates), `type` (text input)
+- **Paraméterek:** `action`, `coordinates` {x, y}, `text`
+- **Példa:** `Készíts CAPTCHA screenshot-ot: action='capture'`
+
+#### 9. **brave_mouse_control** - Mouse Automation
+Teljes egér kontroll emberi mozgással
+- **Akciók:** `move`, `click`, `doubleClick`, `rightClick`, `drag`, `hover`, `screenshot_with_cursor`
+- **Paraméterek:** `action`, `x`, `y`, `targetX`, `targetY`, `duration`
+- **Példa:** `Kattints koordinátákra: action='click', x=300, y=200`
+
+#### 10. **brave_visual_inspect** - Element Detection
+Vizuális elem felismerés és interakció
+- **Módok:** `full_analysis`, `find_element`, `interactive_map`
+- **Paraméterek:** `mode`, `query` (keresett elem szövege)
+- **Visszaad:** Element coordinates, interactive map, analysis
+- **Példa:** `Keresd meg a 'Login' gombot: mode='find_element', query='login'`
+
+## 🎯 Gyors példák minden tool-ra
+
+### Web Scraping
+```
+Scrape-eld le a https://index.hu oldalt és keress Orbán-nal kapcsolatos híreket
+```
+
+### Keresés  
+```
+Keress rá "Claude AI latest news" kifejezésre a Brave search-ben
+```
+
+### Bejelentkezés
+```
+Jelentkezz be a Gmail fiókodba és mentsd el a session-t
+```
+
+### Email olvasás
+```
+Olvass el 5 emailt a Gmail-ből a mentett session-nel
+```
+
+### Visual automation
+```
+Készíts screenshot-ot az oldalról és keresd meg a "Submit" gombot
+```
