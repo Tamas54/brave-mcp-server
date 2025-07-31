@@ -180,6 +180,22 @@ app.post('/mcp', async (req, res) => {
       });
     }
     
+    if (method === 'initialize') {
+      return res.json({
+        id,
+        result: {
+          protocolVersion: '2025-06-18',
+          capabilities: {
+            tools: {}
+          },
+          serverInfo: {
+            name: 'brave-mcp-server',
+            version: '2.0.0'
+          }
+        }
+      });
+    }
+    
     if (method === 'tools/list') {
       const toolList = tools.map(tool => ({
         name: tool.name,
