@@ -36,27 +36,49 @@ const simpleAuth = (req, res, next) => {
   next();
 };
 
-// OAuth-style auth endpoints for Claude Browser
+// OAuth endpoints for Claude Browser (simplified)
 app.post('/oauth/token', (req, res) => {
-  // Simple token endpoint - accept any client
+  console.log('🔐 OAuth token request:', req.body);
+  
+  // Accept any token request
   res.json({
-    access_token: 'brave-mcp-token-' + Date.now(),
-    token_type: 'bearer',
-    expires_in: 3600,
-    scope: 'mcp:tools'
+    access_token: 'brave-mcp-access-token',
+    token_type: 'Bearer',
+    expires_in: 86400,
+    scope: 'read write'
   });
 });
 
 app.get('/oauth/authorize', (req, res) => {
-  // Simple authorization endpoint
-  const { client_id, redirect_uri, response_type } = req.query;
+  console.log('🔐 OAuth authorize request:', req.query);
+  
+  const { client_id, redirect_uri, response_type, state } = req.query;
   
   if (response_type === 'code') {
-    const code = 'brave-auth-code-' + Date.now();
-    return res.redirect(`${redirect_uri}?code=${code}`);
+    const code = 'brave-auth-code-' + Math.random().toString(36).substr(2, 9);
+    const redirectUrl = `${redirect_uri}?code=${code}${state ? `&state=${state}` : ''}`;
+    console.log('🔐 Redirecting to:', redirectUrl);
+    return res.redirect(redirectUrl);
   }
   
-  res.json({ error: 'unsupported_response_type' });
+  res.status(400).json({ 
+    error: 'unsupported_response_type',
+    supported: ['code']
+  });
+});
+
+// OpenID Connect discovery endpoint (Claude might need this)
+app.get('/.well-known/openid_configuration', (req, res) => {
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  
+  res.json({
+    issuer: baseUrl,
+    authorization_endpoint: `${baseUrl}/oauth/authorize`,
+    token_endpoint: `${baseUrl}/oauth/token`,
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code'],
+    token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic', 'none']
+  });
 });
 
 // Health check endpoint
