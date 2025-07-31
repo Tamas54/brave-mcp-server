@@ -2,6 +2,12 @@
 
 Egyszerű MCP szerver Brave böngésző automatizálásához.
 
+## 👥 Contributors
+
+**🚀 Created by:** [Tamas54](https://github.com/Tamas54) & Claude Code  
+**💡 Concept & Implementation:** Tamás  
+**🤖 Development Assistant:** Claude Code
+
 ## Telepítés
 
 ### 📦 Gyors telepítés
