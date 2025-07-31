@@ -154,10 +154,31 @@ app.post('/tools/:toolName', async (req, res) => {
   }
 });
 
-// MCP Protocol endpoint (for compatibility)
+// MCP Protocol endpoint with better error handling
+app.get('/mcp', (req, res) => {
+  // Handle GET requests - return server info
+  res.json({
+    server: 'brave-mcp-server',
+    version: '2.0.0',
+    protocol: 'MCP',
+    methods: ['tools/list', 'tools/call'],
+    timestamp: new Date().toISOString()
+  });
+});
+
 app.post('/mcp', async (req, res) => {
   try {
-    const { method, params } = req.body;
+    console.log('🔧 MCP Request:', JSON.stringify(req.body, null, 2));
+    console.log('🔧 MCP Headers:', req.headers);
+    
+    const { method, params, id } = req.body;
+    
+    if (!method) {
+      return res.status(400).json({ 
+        error: 'Missing method parameter',
+        received: req.body 
+      });
+    }
     
     if (method === 'tools/list') {
       const toolList = tools.map(tool => ({
@@ -166,7 +187,10 @@ app.post('/mcp', async (req, res) => {
         inputSchema: tool.inputSchema
       }));
       
-      return res.json({ tools: toolList });
+      return res.json({ 
+        id,
+        result: { tools: toolList }
+      });
     }
     
     if (method === 'tools/call') {
@@ -175,32 +199,56 @@ app.post('/mcp', async (req, res) => {
       
       if (!tool) {
         return res.status(404).json({ 
-          error: `Tool ${toolName} not found` 
+          id,
+          error: { 
+            code: -32601,
+            message: `Tool ${toolName} not found`,
+            data: { availableTools: tools.map(t => t.name) }
+          }
         });
       }
 
       // Initialize browser if needed
       if (!braveController) {
+        console.log('🚀 Initializing Brave browser...');
         braveController = new BraveController();
         await braveController.initialize();
       }
 
+      console.log(`🔧 Executing tool: ${toolName}`);
       const result = await tool.execute(braveController, params);
       
       return res.json({
-        content: [
-          {
-            type: 'text',
-            text: typeof result === 'string' ? result : JSON.stringify(result, null, 2)
-          }
-        ]
+        id,
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: typeof result === 'string' ? result : JSON.stringify(result, null, 2)
+            }
+          ]
+        }
       });
     }
     
-    res.status(400).json({ error: 'Unknown method' });
+    res.status(400).json({ 
+      id,
+      error: {
+        code: -32601,
+        message: 'Method not found',
+        data: { method, availableMethods: ['tools/list', 'tools/call'] }
+      }
+    });
     
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('❌ MCP Error:', error);
+    res.status(500).json({ 
+      id: req.body?.id,
+      error: {
+        code: -32603,
+        message: error.message
+      }
+    });
   }
 });
 
