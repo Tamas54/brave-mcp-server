@@ -209,49 +209,96 @@ export class BraveController {
   }
 
   async search(query, options = {}) {
-    const searchUrl = `https://search.brave.com/search?q=${encodeURIComponent(query)}`;
-    const page = await this.browser.newPage();
-    
-    try {
-      await page.goto(searchUrl, { 
-        waitUntil: 'domcontentloaded',
-        timeout: 15000 
-      });
-      
-      // Várakozás az eredményekre - több selector próbálása
+    // 2026-05-10 fix — search.brave.com Puppeteer-detektálja és Navigation timeout.
+    // Mind a Brave-search-class-ok ('.snippet', '.snippet-title', stb.) elavultak.
+    // Stabil fallback-chain: (1) Brave HTML — ha működik, (2) DuckDuckGo HTML — anti-bot-szelíd.
+    const limit = options.limit || 10;
+    const tries = [
+      {
+        name: 'brave',
+        url: `https://search.brave.com/search?q=${encodeURIComponent(query)}`,
+        timeout: 8000,
+        // Új Brave HTML class-ok (data-testid alapú, 2026-os struktúra). Ha
+        // a fő selector nem található, üres listával lépünk a következő engine-re.
+        extractor: () => {
+          const items = [];
+          // Több selector-séma próbálása
+          const containers = document.querySelectorAll(
+            '[data-testid="web-result"], .snippet, [data-type="web"]'
+          );
+          containers.forEach(el => {
+            const a = el.querySelector('a[href^="http"]');
+            const titleEl = el.querySelector('h2, .title, .snippet-title');
+            const descEl = el.querySelector('.snippet-description, .description, p');
+            if (a && (titleEl || a.innerText)) {
+              items.push({
+                title: (titleEl ? titleEl.innerText : a.innerText).trim(),
+                url: a.href,
+                description: descEl ? descEl.innerText.trim() : '',
+              });
+            }
+          });
+          return items;
+        },
+      },
+      {
+        name: 'duckduckgo',
+        url: `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+        timeout: 8000,
+        // DDG HTML stabil — class="result__a" + class="result__snippet"
+        extractor: () => {
+          const items = [];
+          document.querySelectorAll('.result').forEach(el => {
+            const a = el.querySelector('a.result__a');
+            const snippet = el.querySelector('.result__snippet');
+            if (a) {
+              let url = a.href;
+              // DDG redirect-URL rendezés: /l/?uddg=https%3A%2F%2F...
+              try {
+                const u = new URL(url, 'https://duckduckgo.com');
+                const real = u.searchParams.get('uddg');
+                if (real) url = decodeURIComponent(real);
+              } catch (_) {}
+              items.push({
+                title: a.innerText.trim(),
+                url,
+                description: snippet ? snippet.innerText.trim() : '',
+              });
+            }
+          });
+          return items;
+        },
+      },
+    ];
+
+    for (const engine of tries) {
+      const page = await this.browser.newPage();
       try {
-        await page.waitForSelector('.snippet', { timeout: 5000 });
+        await page.setUserAgent(
+          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+        );
+        await page.goto(engine.url, { waitUntil: 'domcontentloaded', timeout: engine.timeout });
+        // Adjunk a JS-nek esélyt
+        await new Promise(r => setTimeout(r, 1500));
+        const items = await page.evaluate(engine.extractor);
+        if (items && items.length > 0) {
+          return {
+            query,
+            engine: engine.name,
+            results: items.slice(0, limit),
+          };
+        }
+        // 0 találat → következő engine
       } catch (e) {
-        // Alternatív selectorok próbálása
-        await page.waitForSelector('[data-testid="result"]', { timeout: 5000 });
+        // Engine timeout / hiba → következő engine
+        console.log(`⚠️  search engine ${engine.name} failed: ${e.message}`);
+      } finally {
+        await page.close();
       }
-
-      const results = await page.evaluate(() => {
-        const items = [];
-        document.querySelectorAll('.snippet').forEach(snippet => {
-          const titleEl = snippet.querySelector('.snippet-title');
-          const descEl = snippet.querySelector('.snippet-description');
-          const urlEl = snippet.querySelector('.snippet-url');
-          
-          if (titleEl && urlEl) {
-            items.push({
-              title: titleEl.innerText,
-              url: urlEl.innerText,
-              description: descEl ? descEl.innerText : ''
-            });
-          }
-        });
-        return items;
-      });
-
-      return {
-        query,
-        results: results.slice(0, options.limit || 10)
-      };
-
-    } finally {
-      await page.close();
     }
+
+    // Egyik engine sem adott találatot
+    return { query, engine: 'none', results: [], note: 'Egyetlen search-engine sem adott találatot — érdemes brave_scrape-pel direkt URL-t lehúzni.' };
   }
 
   async close() {

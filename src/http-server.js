@@ -232,7 +232,11 @@ app.post('/mcp', async (req, res) => {
       }
 
       console.log(`🔧 Executing tool: ${toolName}`);
-      const result = await tool.execute(braveController, params);
+      // MCP standard: params = { name, arguments }; tools expect arguments-t.
+      // 2026-05-10 fix — addig az egész params-ot adta át, így pl. a brave_scrape
+      // params.url helyett params.arguments.url-ben kapta az URL-t és undefined volt.
+      const args = params?.arguments ?? {};
+      const result = await tool.execute(braveController, args);
       
       return res.json({
         id,
@@ -348,7 +352,9 @@ wss.on('connection', (ws) => {
           await braveController.initialize();
         }
 
-        const result = await tool.execute(braveController, message.params);
+        // MCP standard: params = { name, arguments }; ugyanaz a fix mint a HTTP ágon.
+        const args = message.params?.arguments ?? {};
+        const result = await tool.execute(braveController, args);
         
         ws.send(JSON.stringify({
           id: message.id,
