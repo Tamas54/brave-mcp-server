@@ -1632,6 +1632,20 @@ export class BraveController {
     if (paywallPatterns.some(s => md.includes(s)) && len < 800) {
       return { usable: false, reason: 'paywall_banner', markdown_len: len };
     }
+    // Internet Archive / Wayback Machine saját splash + no-capture page-ek.
+    // Ezek NEM a target-cikk tartalmát adják vissza — csak az archive saját
+    // belépő-oldalát vagy "nincs ilyen capture" üzenetét.
+    const waybackBlockers = [
+      'Please enable JS and disable any ad blocker',
+      'Hrm. The Wayback Machine has not archived',
+      'Wayback Machine doesn\'t have that page archived',
+      'Ask the publishers to restore access to',
+      'Internet Archive AudioLive Music Archive',
+      'Sorry, we\'re having a tough time loading',
+    ];
+    if (waybackBlockers.some(s => md.includes(s))) {
+      return { usable: false, reason: 'wayback_no_capture', markdown_len: len };
+    }
     return { usable: true, reason: null, markdown_len: len };
   }
 
@@ -1739,21 +1753,16 @@ export class BraveController {
     }
 
     // ── Szint 5: Wayback Machine cache (anti-bot-mentes) ──────────────
-    // A web.archive.org cache-elt verziókat tárol szinte az ÖSSZES mainstream
-    // hírforrásból. Nincs Cloudflare, nincs Turnstile, nincs paywall (a cache
-    // a pre-paywall verziót őrzi). Ez sokszor az utolsó működő út a Reuters /
-    // FT / WSJ / NYT / WaPo-szintű kemény oldalakon.
+    // A `archive.org/wayback/available` JSON-API megmondja a legközelebbi
+    // valódi cache-URL-t (nem a self-redirect /web/<url>-t, ami a homepage-re
+    // mehet). Ezt scrape-eljük aztán a default módban.
     try {
-      const wbUrl = `https://web.archive.org/web/${url}`;
-      const r5 = await this.scrape(wbUrl, { ...baseOptions });
+      const r5 = await this._scrapeViaWaybackMachine(url, baseOptions);
       const eval5 = this._evaluateContent(r5);
       escalation_path.push({ level: 5, mode: 'wayback_machine',
         ok: eval5.usable, md_len: eval5.markdown_len, block_reason: eval5.reason });
       if (eval5.usable) {
-        // Az original-URL-t adjuk vissza a kliensnek, a wayback wrapper-t elrejtjük
-        // (de a metadata-ban marked: source = 'wayback_machine')
-        const r5fin = { ...r5, url, original_scrape_url: wbUrl, content_source: 'wayback_machine' };
-        return finalize(r5fin, escalation_path);
+        return finalize(r5, escalation_path);
       }
       trackBest(r5);
     } catch (e) {
@@ -1787,6 +1796,49 @@ export class BraveController {
       ...this._decorateContentFlags(clean, 'all_levels_blocked'),
       cf_status: 'all_levels_blocked',
       escalation_path,
+    };
+  }
+
+  // Wayback Machine via official JSON-API. Robosztusabb mint a /web/<url>
+  // self-redirect, mert a `closest.url` GARANTÁLTAN valódi cache-snapshot URL.
+  // HA nincs cache → `available: false`, és visszaadunk egy üres-eredményt
+  // a megfelelő block_reason-nel.
+  async _scrapeViaWaybackMachine(url, options = {}) {
+    let availableUrl = null;
+    try {
+      const apiUrl = `https://archive.org/wayback/available?url=${encodeURIComponent(url)}`;
+      const resp = await fetch(apiUrl, {
+        method: 'GET',
+        signal: AbortSignal.timeout(15000),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        const closest = data?.archived_snapshots?.closest;
+        if (closest?.available && closest.status === '200' && closest.url) {
+          availableUrl = closest.url;
+        }
+      }
+    } catch (_) {
+      // hálózati hiba — visszaesés
+    }
+    if (!availableUrl) {
+      return {
+        url,
+        title: '',
+        markdown: '',
+        text: '',
+        cf_status: 'wayback_no_capture',
+        content_source: 'wayback_machine',
+      };
+    }
+    // Scrape-eljük a tényleges Wayback-cache-URL-t a default scrape-pel.
+    // A Wayback cache-page anti-bot-mentes, gyors.
+    const r = await this.scrape(availableUrl, { ...options });
+    return {
+      ...r,
+      url, // eredeti URL, a kliensnek ez a hivatkozás
+      original_scrape_url: availableUrl,
+      content_source: 'wayback_machine',
     };
   }
 
