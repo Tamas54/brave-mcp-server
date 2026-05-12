@@ -16,6 +16,8 @@
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
+| #13123 | 11:26 PM | ✅ | MCP JSON-RPC 2.0 protocol compliance improvements | ~333 |
+| #13116 | 7:11 PM | 🔴 | Content evaluator false-positive fixed with 500-char threshold and CDN interstitial detector | ~577 |
 | #13114 | 7:02 PM | 🔴 | Content evaluation detector enhanced with CDN interstitial detection and raised empty-response threshold | ~541 |
 | #13104 | 6:45 PM | 🟣 | Webclaw L3 TLS-impersonation integrated as side-car container in brave-mcp-server | ~781 |
 | #13102 | 6:43 PM | ✅ | Webclaw L3 integration implementation complete with 271-line codebase modification | ~719 |

@@ -174,14 +174,25 @@ app.post('/mcp', async (req, res) => {
     const { method, params, id } = req.body;
     
     if (!method) {
-      return res.status(400).json({ 
-        error: 'Missing method parameter',
-        received: req.body 
+      return res.status(400).json({
+        jsonrpc: '2.0',
+        id: id ?? null,
+        error: {
+          code: -32600,
+          message: 'Invalid Request: missing method',
+          data: { received: req.body }
+        }
       });
     }
-    
+
+    // MCP "notifications/*" methods are notifications (no id) — must return 202 No Content.
+    if (method.startsWith('notifications/')) {
+      return res.status(202).end();
+    }
+
     if (method === 'initialize') {
       return res.json({
+        jsonrpc: '2.0',
         id,
         result: {
           protocolVersion: '2025-06-18',
@@ -195,28 +206,30 @@ app.post('/mcp', async (req, res) => {
         }
       });
     }
-    
+
     if (method === 'tools/list') {
       const toolList = tools.map(tool => ({
         name: tool.name,
         description: tool.description,
         inputSchema: tool.inputSchema
       }));
-      
-      return res.json({ 
+
+      return res.json({
+        jsonrpc: '2.0',
         id,
         result: { tools: toolList }
       });
     }
-    
+
     if (method === 'tools/call') {
       const toolName = params?.name;
       const tool = tools.find(t => t.name === toolName);
-      
+
       if (!tool) {
-        return res.status(404).json({ 
+        return res.status(404).json({
+          jsonrpc: '2.0',
           id,
-          error: { 
+          error: {
             code: -32601,
             message: `Tool ${toolName} not found`,
             data: { availableTools: tools.map(t => t.name) }
@@ -237,8 +250,9 @@ app.post('/mcp', async (req, res) => {
       // params.url helyett params.arguments.url-ben kapta az URL-t és undefined volt.
       const args = params?.arguments ?? {};
       const result = await tool.execute(braveController, args);
-      
+
       return res.json({
+        jsonrpc: '2.0',
         id,
         result: {
           content: [
@@ -250,20 +264,22 @@ app.post('/mcp', async (req, res) => {
         }
       });
     }
-    
-    res.status(400).json({ 
-      id,
+
+    res.status(400).json({
+      jsonrpc: '2.0',
+      id: id ?? null,
       error: {
         code: -32601,
         message: 'Method not found',
-        data: { method, availableMethods: ['tools/list', 'tools/call'] }
+        data: { method, availableMethods: ['initialize', 'tools/list', 'tools/call'] }
       }
     });
-    
+
   } catch (error) {
     console.error('❌ MCP Error:', error);
-    res.status(500).json({ 
-      id: req.body?.id,
+    res.status(500).json({
+      jsonrpc: '2.0',
+      id: req.body?.id ?? null,
       error: {
         code: -32603,
         message: error.message
