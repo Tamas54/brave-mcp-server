@@ -16,6 +16,9 @@
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
+| #13114 | 7:02 PM | 🔴 | Content evaluation detector enhanced with CDN interstitial detection and raised empty-response threshold | ~541 |
+| #13104 | 6:45 PM | 🟣 | Webclaw L3 TLS-impersonation integrated as side-car container in brave-mcp-server | ~781 |
+| #13102 | 6:43 PM | ✅ | Webclaw L3 integration implementation complete with 271-line codebase modification | ~719 |
 | #13084 | 6:07 PM | 🔴 | Enhanced paywall detection handles nav-inflated pages and title-level stubs | ~160 |
 | #13081 | 6:02 PM | 🔴 | JS stub detector enhanced for navigation-heavy pages like biddr.com | ~147 |
 | #13078 | 6:00 PM | ✅ | Webclaw Level 3 integration test framework created | ~488 |

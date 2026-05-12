@@ -1714,11 +1714,29 @@ export class BraveController {
     }
     const md = result.markdown || result.text || '';
     const len = md.length;
-    if (!md || len < 200) {
+    // Empty-response küszöb 500 chars (volt 200 — túl alacsony, 259-charos
+    // FT-féle "Security Verification" stub-ok átengedtek false-positive-ként).
+    if (!md || len < 500) {
       return { usable: false, reason: 'empty_response', markdown_len: len };
     }
     if (this._isCloudflareChallenge(md)) {
       return { usable: false, reason: 'cloudflare_challenge', markdown_len: len };
+    }
+    // CDN-/szerver-szintű "Security Verification" interstitial-ok (FT,
+    // Akamai, Imperva) — a Webclaw HTTP 403-as választ kap a CDN edge-ről,
+    // és a markdown ilyen kis stub: "Challenge Request ID ... Status Code 403"
+    const cdnInterstitialPatterns = [
+      'Security Verification',
+      'Challenge Request ID',
+      'Status Code 403',
+      'Status Code 401',
+      'Status Code 429',
+      'Request blocked',
+      'Access blocked',
+    ];
+    const mdInterstitial = md.slice(0, 800);
+    if (cdnInterstitialPatterns.filter(s => mdInterstitial.includes(s)).length >= 2) {
+      return { usable: false, reason: 'cdn_interstitial', markdown_len: len };
     }
     const jsPromptPatterns = [
       'Javascript is required for full functionality',
