@@ -1,7 +1,7 @@
 export const tools = [
   {
     name: 'brave_scrape',
-    description: 'Weboldal tartalmának scrape-elése Brave böngészővel (puppeteer-extra + StealthPlugin). Opt-in "stealth" mód a Cloudflare-fal mögötti oldalakhoz.',
+    description: 'Weboldal tartalmának scrape-elése. Default: gyors Puppeteer-Stealth. Az `auto_fallback: true` kapcsolóval a server automatikusan eszkalál (stealth → FlareSolverr → FlareSolverr+render) anti-bot védelem alapján — egy hívás, transzparens chain, `escalation_path` visszacsatolás.',
     handler: 'tools/call',
     inputSchema: {
       type: 'object',
@@ -33,6 +33,10 @@ export const tools = [
         flaresolverr: {
           type: 'boolean',
           description: '3. anti-bot szint: külső FlareSolverr-szolgáltatás (undetected-chromedriver) bypassa a Cloudflare Turnstile-tier védelmet. Csak akkor használd, ha stealth=true is "cf_status: blocked"-ot adott. Lassú (30-90s solve), de magas Turnstile siker-ráta. Konfiguráció: FLARESOLVERR_URL env-vár a brave-mcp-server-en (Railway internal URL pl. http://flaresolverr.railway.internal:8191/v1).'
+        },
+        auto_fallback: {
+          type: 'boolean',
+          description: 'AJÁNLOTT bonyolult/ismeretlen webhelyekhez. Automatikus escalation chain — a server végigviszi a 4 szintet anti-bot védelem alapján: (1) default scrape ~5s, (2) stealth ~5-19s, (3) FlareSolverr ~30-90s, (4) FlareSolverr+Puppeteer-render. Az agent CSAK ezt a flag-et adja meg, a server intelligensen választ. Visszacsatolás `escalation_path` mezőben. Default false (= explicit single-mode scrape). Worst-case ~140s.'
         }
       },
       required: ['url']
