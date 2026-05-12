@@ -100,8 +100,11 @@ export class BraveController {
     // server végigviszi a chain-t:
     //   1) default scrape (~5s)         — ha "JS required" / üres-stub →
     //   2) stealth scrape (~5-19s)      — ha blocked →
-    //   3) FlareSolverr (~30-90s)       — ha SPA-stub →
-    //   4) FlareSolverr+render (~60s)   — FlareSolverr cookies+UA-val Puppeteer-render
+    //   3) Webclaw (~0.2-1s)            — wreq Chrome 142 TLS-impersonáció,
+    //                                     DataDome/Turnstile-killer (NEM JS) →
+    //   4) FlareSolverr (~30-90s)       — JS+CAPTCHA-combo fallback →
+    //   5) FlareSolverr+render (~60s)   — FlareSolverr cookies+UA-val Puppeteer-render →
+    //   6) Wayback Machine cache (~10s) → 7) Google AMP mirror (~10s)
     // A visszaadott payload tartalmazza az `escalation_path` mezőt — telemetria
     // a kliens (Bridge agent) számára.
     if (options.auto_fallback === true) {
@@ -127,6 +130,26 @@ export class BraveController {
         };
       }
       return await this._scrapeViaFlareSolverr(url, options);
+    }
+
+    // ─── WEBCLAW PATH — opt-in, 7. anti-bot szint ───────────────────────
+    // options.webclaw === true esetén: bypass Puppeteer és FlareSolverr,
+    // a WEBCLAW_URL env-on futó Webclaw REST API-t hívjuk. A Webclaw wreq +
+    // BoringSSL Chrome 142+ TLS-impersonációval szúr át DataDome JA4+
+    // védelmen — Reuters/Bloomberg tier-3 cikkek is bejönnek <1s alatt
+    // mobile proxy nélkül. Lokálisan ./webclaw/target/release/webclaw-server.
+    if (options.webclaw === true) {
+      if (!process.env.WEBCLAW_URL) {
+        return {
+          url,
+          title: '',
+          markdown: '',
+          text: '',
+          cf_status: 'webclaw_not_configured',
+          error: 'WEBCLAW_URL environment variable is not set on the brave-mcp-server. Configure it (e.g. http://127.0.0.1:3000 lokálisan vagy Railway publikus URL) to enable the Webclaw L7 path.',
+        };
+      }
+      return await this._scrapeViaWebclaw(url, options);
     }
 
     const page = await this.browser.newPage();
@@ -1584,6 +1607,93 @@ export class BraveController {
   }
 
   // ════════════════════════════════════════════════════════════════════
+  //  WEBCLAW FALLBACK — 3. anti-bot szint (2026-05-12)
+  // ════════════════════════════════════════════════════════════════════
+  // Webclaw (0xMassi/webclaw) — Rust-alapú, wreq + BoringSSL TLS-impersonáció
+  // Chrome 142+/Firefox 144+ profilokkal. JA4+ ujjlenyomatot tökéletesen
+  // szimulál → DataDome / Cloudflare network-szintű védelmet ÁTSZÚR.
+  //   - Nem futtat JS-t (statikus HTML scrape pure-network módban)
+  //   - 0.2-1s/req (vs FlareSolverr 30-90s)
+  //   - Reuters tier-3 + biddr Turnstile bizonyítottan átszúrhatóak
+  //   - LICENC: AGPL-3.0 → privát/internal hívás OK, NE expose-old publikus API-ként
+  //
+  // Konfiguráció: WEBCLAW_URL env-vár (pl. http://127.0.0.1:3000 lokál, vagy
+  // Railway publikus URL). Stateless REST API: POST /v1/scrape.
+  async _scrapeViaWebclaw(url, options = {}) {
+    const webclawUrl = process.env.WEBCLAW_URL;
+    const timeoutMs = Math.min(options.timeout || 30000, 60000);
+
+    const payload = {
+      url,
+      formats: ['markdown'],
+      only_main_content: options.only_main_content !== false,
+    };
+
+    let response;
+    try {
+      const resp = await fetch(`${webclawUrl.replace(/\/+$/, '')}/v1/scrape`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!resp.ok) {
+        return {
+          url,
+          title: '',
+          markdown: '',
+          text: '',
+          cf_status: 'webclaw_http_error',
+          error: `Webclaw HTTP ${resp.status}: ${(await resp.text()).slice(0, 300)}`,
+        };
+      }
+      response = await resp.json();
+    } catch (e) {
+      return {
+        url,
+        title: '',
+        markdown: '',
+        text: '',
+        cf_status: 'webclaw_network_error',
+        error: `Webclaw unreachable: ${e.name}: ${e.message}`,
+      };
+    }
+
+    const markdown = response.markdown || '';
+    const meta = response.metadata || {};
+    const finalUrl = meta.url || response.url || url;
+
+    // Plain-text származtatás a markdown-ból — link-stripping, image-removal,
+    // whitespace-collapse. Az _evaluateContent stub-detektora ezt is megnézi.
+    const text = markdown
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, '')         // images
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')       // links → link-text
+      .replace(/[#*_>`~]/g, '')                       // markdown formatting
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const result = {
+      url: finalUrl,
+      title: meta.title || '',
+      metadata: {
+        title: meta.title,
+        description: meta.description,
+        url: finalUrl,
+        language: meta.language || 'en',
+        author: meta.author,
+        publishedTime: meta.published_time || meta.publishedTime,
+        modifiedTime: meta.modified_time || meta.modifiedTime,
+        webclaw_browser_profile: meta.browser_profile || 'chrome-default',
+      },
+      markdown,
+      text,
+      cf_status: 'via_webclaw',
+      content_source: 'webclaw',
+    };
+    return this._decorateContentFlags(result);
+  }
+
+  // ════════════════════════════════════════════════════════════════════
   //  AUTO-FALLBACK ESCALATION CHAIN — 2026-05-12
   // ════════════════════════════════════════════════════════════════════
   // Az agent egyszeri hívással megkapja a leg-legmagasabb-tartalmú eredményt.
@@ -1617,19 +1727,47 @@ export class BraveController {
       'Verify you are human',
       'unusual activity from your browser',
     ];
-    if (jsPromptPatterns.some(s => md.includes(s)) && len < 600) {
+    // Két detektor:
+    //   (a) Rövid markdown bárhol — a klasszikus eset
+    //   (b) Hosszabb markdown DE a stub-szöveg az első 300 char-ban van —
+    //       a biddr-szerű "JS required + sok nav-link" eset, ahol a stub
+    //       a content TETEJÉN ül és a navigation-szöveg felfújja az md_len-t.
+    const mdHead = md.slice(0, 300);
+    if (
+      (jsPromptPatterns.some(s => md.includes(s)) && len < 600) ||
+      jsPromptPatterns.some(s => mdHead.includes(s))
+    ) {
       return { usable: false, reason: 'js_required_stub', markdown_len: len };
     }
     // Paywall-banner: néha a cikkszöveg helyett bejelentkezési felületet
-    // ad vissza a server. A "Login or register" / "Subscribe to continue"
-    // ÉS rövid markdown együtt = paywall.
+    // ad vissza a server. Két detektor:
+    //   (a) Klasszikus "Subscribe to continue" + rövid md (< 800 chars)
+    //   (b) Nav-felfújt paywall (FT, NYT, WSJ): a paywall-szöveg az első
+    //       1500 char-ban van, de a teljes md hosszabb a sok nav-link miatt
     const paywallPatterns = [
       'Subscribe to continue reading',
       'Sign in to continue',
       'Please log in to continue',
       'To continue reading, subscribe',
+      'Subscribe to unlock this article',
+      'Subscribe to read',
+      'Try unlimited access',
+      'Subscribe for full access',
+      'This article is for subscribers only',
+      'Become a subscriber to read',
     ];
-    if (paywallPatterns.some(s => md.includes(s)) && len < 800) {
+    const mdEarly = md.slice(0, 1500);
+    if (
+      (paywallPatterns.some(s => md.includes(s)) && len < 800) ||
+      paywallPatterns.some(s => mdEarly.includes(s))
+    ) {
+      return { usable: false, reason: 'paywall_banner', markdown_len: len };
+    }
+    // Title-szintű paywall-stub: ha a title maga "Subscribe to ..." / "Sign in"
+    // mintával kezdődik, az gyanús — a valódi cikkcím helyett a paywall-oldal
+    // címét kaptuk.
+    const title = (result.title || '').trim();
+    if (/^(Subscribe to|Sign in|Log in to|Login to)/i.test(title) && len < 8000) {
       return { usable: false, reason: 'paywall_banner', markdown_len: len };
     }
     // Internet Archive / Wayback Machine saját splash + no-capture page-ek.
@@ -1714,79 +1852,103 @@ export class BraveController {
       escalation_path.push({ level: 2, mode: 'stealth', error: e.message });
     }
 
-    // ── Szint 3: FlareSolverr direct (~30-90s) ─────────────────────────
-    let r3 = null;
-    if (process.env.FLARESOLVERR_URL) {
+    // ── Szint 3: Webclaw TLS-impersonáció (~0.2-1s) ────────────────────
+    // wreq + BoringSSL Chrome 142+ JA4+ fingerprint. DataDome / Cloudflare
+    // network-szintű védelmet átszúr JS-futtatás nélkül. Reuters tier-3 +
+    // biddr Turnstile bizonyítottan átszúrhatóak. AGPL-3.0 → csak privát.
+    // WEBCLAW_URL env-vár (lokál: http://127.0.0.1:3000, vagy Railway).
+    if (process.env.WEBCLAW_URL) {
       try {
-        r3 = await this._scrapeViaFlareSolverr(url, baseOptions);
+        const r3 = await this._scrapeViaWebclaw(url, baseOptions);
         const eval3 = this._evaluateContent(r3);
-        escalation_path.push({ level: 3, mode: 'flaresolverr',
+        escalation_path.push({ level: 3, mode: 'webclaw',
           ok: eval3.usable, md_len: eval3.markdown_len,
           cf_status: r3?.cf_status, block_reason: eval3.reason });
         if (eval3.usable) return finalize(r3, escalation_path);
         trackBest(r3);
       } catch (e) {
-        escalation_path.push({ level: 3, mode: 'flaresolverr', error: e.message });
+        escalation_path.push({ level: 3, mode: 'webclaw', error: e.message });
       }
     } else {
-      escalation_path.push({ level: 3, mode: 'flaresolverr',
-        skipped: 'FLARESOLVERR_URL not configured' });
+      escalation_path.push({ level: 3, mode: 'webclaw',
+        skipped: 'WEBCLAW_URL not configured' });
     }
 
-    // ── Szint 4: FlareSolverr session → Puppeteer-render ──────────────
-    const session = r3?._flaresolverr_session;
-    if (session && Array.isArray(session.cookies) && session.cookies.length) {
+    // ── Szint 4: FlareSolverr direct (~30-90s) ─────────────────────────
+    // Csak akkor jövünk ide, ha Webclaw (L3) nem oldotta meg — ami azt
+    // jelenti, hogy az oldal JS-render-igényes vagy aktív CAPTCHA-t prezentál.
+    let r4 = null;
+    if (process.env.FLARESOLVERR_URL) {
       try {
-        const r4 = await this._renderWithFlareSolverrSession(url, session, baseOptions);
+        r4 = await this._scrapeViaFlareSolverr(url, baseOptions);
         const eval4 = this._evaluateContent(r4);
-        escalation_path.push({ level: 4, mode: 'flaresolverr_render',
+        escalation_path.push({ level: 4, mode: 'flaresolverr',
           ok: eval4.usable, md_len: eval4.markdown_len,
           cf_status: r4?.cf_status, block_reason: eval4.reason });
         if (eval4.usable) return finalize(r4, escalation_path);
         trackBest(r4);
       } catch (e) {
-        escalation_path.push({ level: 4, mode: 'flaresolverr_render', error: e.message });
+        escalation_path.push({ level: 4, mode: 'flaresolverr', error: e.message });
       }
     } else {
-      escalation_path.push({ level: 4, mode: 'flaresolverr_render',
+      escalation_path.push({ level: 4, mode: 'flaresolverr',
+        skipped: 'FLARESOLVERR_URL not configured' });
+    }
+
+    // ── Szint 5: FlareSolverr session → Puppeteer-render ──────────────
+    const session = r4?._flaresolverr_session;
+    if (session && Array.isArray(session.cookies) && session.cookies.length) {
+      try {
+        const r5 = await this._renderWithFlareSolverrSession(url, session, baseOptions);
+        const eval5 = this._evaluateContent(r5);
+        escalation_path.push({ level: 5, mode: 'flaresolverr_render',
+          ok: eval5.usable, md_len: eval5.markdown_len,
+          cf_status: r5?.cf_status, block_reason: eval5.reason });
+        if (eval5.usable) return finalize(r5, escalation_path);
+        trackBest(r5);
+      } catch (e) {
+        escalation_path.push({ level: 5, mode: 'flaresolverr_render', error: e.message });
+      }
+    } else {
+      escalation_path.push({ level: 5, mode: 'flaresolverr_render',
         skipped: 'no usable FlareSolverr session' });
     }
 
-    // ── Szint 5: Wayback Machine cache (anti-bot-mentes) ──────────────
+    // ── Szint 6: Wayback Machine cache (anti-bot-mentes) ──────────────
     // A `archive.org/wayback/available` JSON-API megmondja a legközelebbi
     // valódi cache-URL-t (nem a self-redirect /web/<url>-t, ami a homepage-re
     // mehet). Ezt scrape-eljük aztán a default módban.
     try {
-      const r5 = await this._scrapeViaWaybackMachine(url, baseOptions);
-      const eval5 = this._evaluateContent(r5);
-      escalation_path.push({ level: 5, mode: 'wayback_machine',
-        ok: eval5.usable, md_len: eval5.markdown_len, block_reason: eval5.reason });
-      if (eval5.usable) {
-        return finalize(r5, escalation_path);
+      const r6 = await this._scrapeViaWaybackMachine(url, baseOptions);
+      const eval6 = this._evaluateContent(r6);
+      escalation_path.push({ level: 6, mode: 'wayback_machine',
+        ok: eval6.usable, md_len: eval6.markdown_len, block_reason: eval6.reason });
+      if (eval6.usable) {
+        return finalize(r6, escalation_path);
       }
-      trackBest(r5);
+      trackBest(r6);
     } catch (e) {
-      escalation_path.push({ level: 5, mode: 'wayback_machine', error: e.message });
+      escalation_path.push({ level: 6, mode: 'wayback_machine', error: e.message });
     }
 
-    // ── Szint 6: Google AMP mirror ─────────────────────────────────────
+    // ── Szint 7: Google AMP mirror ─────────────────────────────────────
     // Az AMP-verzió sok mainstream news-cikknél elérhető és nincs paywall.
     // A google.com/amp/s/<host>/<path> trükkel a Google-cache-AMP-renderét
     // hívjuk. Sokszor utolsó cseppet ad a Reuters / Bloomberg / FT cikkekhez.
     try {
       const u = new URL(url);
       const ampUrl = `https://www.google.com/amp/s/${u.host}${u.pathname}${u.search}`;
-      const r6 = await this.scrape(ampUrl, { ...baseOptions, stealth: true });
-      const eval6 = this._evaluateContent(r6);
-      escalation_path.push({ level: 6, mode: 'google_amp',
-        ok: eval6.usable, md_len: eval6.markdown_len, block_reason: eval6.reason });
-      if (eval6.usable) {
-        const r6fin = { ...r6, url, original_scrape_url: ampUrl, content_source: 'google_amp' };
-        return finalize(r6fin, escalation_path);
+      const r7 = await this.scrape(ampUrl, { ...baseOptions, stealth: true });
+      const eval7 = this._evaluateContent(r7);
+      escalation_path.push({ level: 7, mode: 'google_amp',
+        ok: eval7.usable, md_len: eval7.markdown_len, block_reason: eval7.reason });
+      if (eval7.usable) {
+        const r7fin = { ...r7, url, original_scrape_url: ampUrl, content_source: 'google_amp' };
+        return finalize(r7fin, escalation_path);
       }
-      trackBest(r6);
+      trackBest(r7);
     } catch (e) {
-      escalation_path.push({ level: 6, mode: 'google_amp', error: e.message });
+      escalation_path.push({ level: 7, mode: 'google_amp', error: e.message });
     }
 
     // ── Minden szint blocked ───────────────────────────────────────────

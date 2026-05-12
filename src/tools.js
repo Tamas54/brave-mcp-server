@@ -1,7 +1,7 @@
 export const tools = [
   {
     name: 'brave_scrape',
-    description: 'Weboldal tartalmának scrape-elése. Default: gyors Puppeteer-Stealth. Az `auto_fallback: true` kapcsolóval a server automatikusan eszkalál (stealth → FlareSolverr → FlareSolverr+render) anti-bot védelem alapján — egy hívás, transzparens chain, `escalation_path` visszacsatolás.',
+    description: 'Weboldal tartalmának scrape-elése. Default: gyors Puppeteer-Stealth. Az `auto_fallback: true` kapcsolóval a server automatikusan eszkalál (stealth → Webclaw TLS-impersonáció → FlareSolverr → FlareSolverr+render → Wayback → AMP) anti-bot védelem alapján — egy hívás, transzparens 7-szintű chain, `escalation_path` visszacsatolás.',
     handler: 'tools/call',
     inputSchema: {
       type: 'object',
@@ -30,13 +30,17 @@ export const tools = [
           type: 'boolean',
           description: 'Fejlett anti-bot mód: UA + viewport randomizáció, per-domain cookie-jar (cf_clearance őrzés), Cloudflare-challenge auto-resolve. Bekapcsolva, ha az alap scrape egy Cloudflare-falba ütközött ("Just a moment", "Verify you are human"). Default: false (gyors path, 0 extra overhead). Lassít ~50ms a happy-path-on, +14s worst-case challenge esetén.'
         },
+        webclaw: {
+          type: 'boolean',
+          description: '3. anti-bot szint: Webclaw (wreq+BoringSSL Chrome 142 TLS-impersonáció). JA4+ ujjlenyomatot tökéletesen szimulál → DataDome (Reuters) / Turnstile (biddr) network-szintű védelmet átszúr 0.2-1s alatt. NEM futtat JS-t (statikus HTML scrape). Konfiguráció: WEBCLAW_URL env-vár (lokál: http://127.0.0.1:3000, vagy Railway URL).'
+        },
         flaresolverr: {
           type: 'boolean',
-          description: '3. anti-bot szint: külső FlareSolverr-szolgáltatás (undetected-chromedriver) bypassa a Cloudflare Turnstile-tier védelmet. Csak akkor használd, ha stealth=true is "cf_status: blocked"-ot adott. Lassú (30-90s solve), de magas Turnstile siker-ráta. Konfiguráció: FLARESOLVERR_URL env-vár a brave-mcp-server-en (Railway internal URL pl. http://flaresolverr.railway.internal:8191/v1).'
+          description: '4. anti-bot szint: külső FlareSolverr-szolgáltatás (undetected-chromedriver) — JS-render+CAPTCHA combo esetén. Csak akkor használd, ha webclaw=true is blokkban végzett (ritka, csak ha aktív CAPTCHA prezentált). Lassú (30-90s solve). Konfiguráció: FLARESOLVERR_URL env-vár (Railway internal URL pl. http://flaresolverr.railway.internal:8191/v1).'
         },
         auto_fallback: {
           type: 'boolean',
-          description: 'AJÁNLOTT bonyolult/ismeretlen webhelyekhez. Automatikus escalation chain — a server végigviszi a 4 szintet anti-bot védelem alapján: (1) default scrape ~5s, (2) stealth ~5-19s, (3) FlareSolverr ~30-90s, (4) FlareSolverr+Puppeteer-render. Az agent CSAK ezt a flag-et adja meg, a server intelligensen választ. Visszacsatolás `escalation_path` mezőben. Default false (= explicit single-mode scrape). Worst-case ~140s.'
+          description: 'AJÁNLOTT bonyolult/ismeretlen webhelyekhez. Automatikus 7-szintű escalation chain anti-bot védelem alapján: (1) default ~5s, (2) stealth ~5-19s, (3) Webclaw TLS-impersonáció ~0.2-1s, (4) FlareSolverr ~30-90s, (5) FlareSolverr+Puppeteer-render ~60s, (6) Wayback Machine ~10s, (7) Google AMP mirror ~10s. Az agent CSAK ezt a flag-et adja meg, a server intelligensen választ. Visszacsatolás `escalation_path` mezőben. Default false. Worst-case ~150s.'
         }
       },
       required: ['url']

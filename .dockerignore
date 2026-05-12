@@ -11,5 +11,10 @@ Dockerfile
 .sessions-backup/
 test.js
 claude-test.js
+test-webclaw-l7.js
 key.pem
 cert.pem
+
+# Local Webclaw PoC (~1.1GB) — Webclaw is cloned & built inside Stage 1
+# of the Dockerfile from upstream GitHub, not from this local mirror.
+webclaw-poc/

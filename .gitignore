@@ -8,3 +8,7 @@ yarn-debug.log*
 yarn-error.log*
 .DS_Store
 Thumbs.db
+
+# Local Webclaw PoC (AGPL-3.0 source, large toolchain + target dirs ~1.1GB)
+# Kept local-only; not redistributed via this repo.
+webclaw-poc/
