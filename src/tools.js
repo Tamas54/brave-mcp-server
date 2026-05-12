@@ -29,6 +29,10 @@ export const tools = [
         stealth: {
           type: 'boolean',
           description: 'Fejlett anti-bot mód: UA + viewport randomizáció, per-domain cookie-jar (cf_clearance őrzés), Cloudflare-challenge auto-resolve. Bekapcsolva, ha az alap scrape egy Cloudflare-falba ütközött ("Just a moment", "Verify you are human"). Default: false (gyors path, 0 extra overhead). Lassít ~50ms a happy-path-on, +14s worst-case challenge esetén.'
+        },
+        flaresolverr: {
+          type: 'boolean',
+          description: '3. anti-bot szint: külső FlareSolverr-szolgáltatás (undetected-chromedriver) bypassa a Cloudflare Turnstile-tier védelmet. Csak akkor használd, ha stealth=true is "cf_status: blocked"-ot adott. Lassú (30-90s solve), de magas Turnstile siker-ráta. Konfiguráció: FLARESOLVERR_URL env-vár a brave-mcp-server-en (Railway internal URL pl. http://flaresolverr.railway.internal:8191/v1).'
         }
       },
       required: ['url']

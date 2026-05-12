@@ -94,6 +94,27 @@ export class BraveController {
   }
 
   async scrape(url, options = {}) {
+    // ─── FLARESOLVERR PATH — opt-in, 3. anti-bot szint ──────────────────
+    // options.flaresolverr === true esetén: bypassoljuk a teljes Puppeteer
+    // pipeline-t és a `FLARESOLVERR_URL` env-on futó FlareSolverr Docker-
+    // szolgáltatáson keresztül scrape-elünk. Az ott futó undetected-
+    // chromedriver a Cloudflare Turnstile-szintű falakat is megnyitja.
+    // Csak akkor érdemes ha (a) FLARESOLVERR_URL set és (b) a stealth mode
+    // is `blocked`-ot adott vagy nincs is bekapcsolva.
+    if (options.flaresolverr === true) {
+      if (!process.env.FLARESOLVERR_URL) {
+        return {
+          url,
+          title: '',
+          markdown: '',
+          text: '',
+          cf_status: 'flaresolverr_not_configured',
+          error: 'FLARESOLVERR_URL environment variable is not set on the brave-mcp-server. Configure it in Railway env to enable the FlareSolverr fallback path.',
+        };
+      }
+      return await this._scrapeViaFlareSolverr(url, options);
+    }
+
     const page = await this.browser.newPage();
 
     // ─── STEALTH MODE — opt-in, opciós paraméter ────────────────────────
@@ -1426,6 +1447,117 @@ export class BraveController {
 
   static _sleep(ms) {
     return new Promise(r => setTimeout(r, ms));
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  FLARESOLVERR FALLBACK — 3. anti-bot szint (2026-05-12)
+  // ════════════════════════════════════════════════════════════════════
+  // A FlareSolverr egy önálló Docker-szolgáltatás (Railway-en külön service),
+  // ami undetected-chromedriver-rel megy keresztül a Cloudflare Turnstile-on
+  // és más magas-tier anti-bot pipeline-okon. A brave-mcp-server POST-ol egy
+  // `cmd: request.get`-et és visszakapja a feloldott HTML-t + cookie-kat.
+  //
+  // Konfiguráció: FLARESOLVERR_URL env-vár (pl. http://flaresolverr.railway.internal:8191/v1)
+  // FlareSolverr docker image: ghcr.io/flaresolverr/flaresolverr:latest
+  async _scrapeViaFlareSolverr(url, options = {}) {
+    const flaresolverrUrl = process.env.FLARESOLVERR_URL;
+    const maxTimeout = Math.min(options.timeout || 60000, 120000);
+
+    const payload = {
+      cmd: 'request.get',
+      url,
+      maxTimeout,
+    };
+
+    let response;
+    try {
+      const resp = await fetch(flaresolverrUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        // FlareSolverr challenge-solve mérete: max ~90s, +20s buffer
+        signal: AbortSignal.timeout(maxTimeout + 20000),
+      });
+      if (!resp.ok) {
+        return {
+          url,
+          title: '',
+          markdown: '',
+          text: '',
+          cf_status: 'flaresolverr_http_error',
+          error: `FlareSolverr HTTP ${resp.status}: ${(await resp.text()).slice(0, 300)}`,
+        };
+      }
+      response = await resp.json();
+    } catch (e) {
+      return {
+        url,
+        title: '',
+        markdown: '',
+        text: '',
+        cf_status: 'flaresolverr_network_error',
+        error: `FlareSolverr unreachable: ${e.name}: ${e.message}`,
+      };
+    }
+
+    if (response.status !== 'ok' || !response.solution) {
+      return {
+        url,
+        title: '',
+        markdown: '',
+        text: '',
+        cf_status: 'flaresolverr_solve_failed',
+        error: `FlareSolverr returned status=${response.status}, message=${response.message || ''}`,
+      };
+    }
+
+    const sol = response.solution;
+    const html = sol.response || '';
+    const $ = cheerio.load(html);
+    const finalUrl = sol.url || url;
+
+    // Metadata (ugyanaz a pattern mint a normál scrape-ben)
+    const metadata = {
+      title: $('title').text() || $('meta[property="og:title"]').attr('content'),
+      description: $('meta[name="description"]').attr('content') || $('meta[property="og:description"]').attr('content'),
+      url: finalUrl,
+      language: $('html').attr('lang') || 'en',
+      author: $('meta[name="author"]').attr('content'),
+      publishedTime: $('meta[property="article:published_time"]').attr('content'),
+      modifiedTime: $('meta[property="article:modified_time"]').attr('content'),
+      flaresolverr_user_agent: sol.userAgent,
+    };
+
+    const bodyHtml = $('body').html() || html;
+    const markdown = this.turndownService.turndown(bodyHtml);
+    const text = $('body').text().replace(/\s+/g, ' ').trim();
+
+    // Persistáljuk a FlareSolverr cookie-kat is — ha sikerült az áttörés,
+    // a clearance cookie ~30 perc – 2 óra ÉLŐ, és a következő scrape már
+    // a sima stealth path-on is működhet vele.
+    if (Array.isArray(sol.cookies) && sol.cookies.length) {
+      try {
+        const domain = new URL(finalUrl).hostname;
+        const cookiePath = path.join(process.cwd(), '.sessions', `_cookies_${domain}.json`);
+        await fs.mkdir(path.dirname(cookiePath), { recursive: true });
+        await fs.writeFile(
+          cookiePath,
+          JSON.stringify({ domain, timestamp: Date.now(), cookies: sol.cookies, source: 'flaresolverr' }, null, 2),
+        );
+      } catch (_) {
+        // silent fail
+      }
+    }
+
+    return {
+      url: finalUrl,
+      title: metadata.title,
+      metadata,
+      markdown,
+      text,
+      html: options.includeHtml ? html : undefined,
+      cf_status: 'via_flaresolverr',
+    };
   }
 }
 
