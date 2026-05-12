@@ -264,7 +264,7 @@ export class BraveController {
         }
       });
 
-      return {
+      const result = {
         url: page.url(),
         title: metadata.title,
         metadata,
@@ -276,6 +276,8 @@ export class BraveController {
         // cf_status: 'none' | 'cleared_attempt_N' | 'blocked' — kliens-side telemetria
         cf_status: cfStatus,
       };
+      // Content-flag dekorálás — content_usable + block_reason + markdown_warning
+      return this._decorateContentFlags(result);
 
     } finally {
       await page.close();
@@ -1563,7 +1565,7 @@ export class BraveController {
       }
     }
 
-    return {
+    const result = {
       url: finalUrl,
       title: metadata.title,
       metadata,
@@ -1578,6 +1580,7 @@ export class BraveController {
         userAgent: sol.userAgent,
       },
     };
+    return this._decorateContentFlags(result);
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -1588,23 +1591,69 @@ export class BraveController {
   // mező transparens log: mely szintek lettek megpróbálva, melyik nyert.
 
   _isBlockedOrEmpty(result) {
-    // Anti-bot vagy üres-tartalom-detektor. Kombinálja a CF-challenge
-    // pattern-eket a "JavaScript required" prompttal és túl-rövid markdown-nal.
-    if (!result) return true;
+    // Backwards-compatible boolean wrapper a régi callsite-okhoz.
+    return !this._evaluateContent(result).usable;
+  }
+
+  // Új objektum-orientált detector: {usable, reason, markdown_len}.
+  // A scrape()/escalation chain ezt használja, hogy a payload-ban
+  // EGYÉRTELMŰ content_usable + block_reason mezőt adhasson vissza.
+  _evaluateContent(result) {
+    if (!result) {
+      return { usable: false, reason: 'empty_response', markdown_len: 0 };
+    }
     const md = result.markdown || result.text || '';
-    if (!md || md.length < 200) return true;
-    // Cloudflare-challenge oldalak — explicit indikátorok
-    if (this._isCloudflareChallenge(md)) return true;
-    // biddr.com és társai JS-prompt-oldalakat adnak a Cloudflare ALATT is
-    const blocked = [
+    const len = md.length;
+    if (!md || len < 200) {
+      return { usable: false, reason: 'empty_response', markdown_len: len };
+    }
+    if (this._isCloudflareChallenge(md)) {
+      return { usable: false, reason: 'cloudflare_challenge', markdown_len: len };
+    }
+    const jsPromptPatterns = [
       'Javascript is required for full functionality',
       'Please enable JavaScript',
       'enable-javascript.com',
       'Verify you are human',
       'unusual activity from your browser',
     ];
-    if (blocked.some(s => md.includes(s)) && md.length < 600) return true;
-    return false;
+    if (jsPromptPatterns.some(s => md.includes(s)) && len < 600) {
+      return { usable: false, reason: 'js_required_stub', markdown_len: len };
+    }
+    // Paywall-banner: néha a cikkszöveg helyett bejelentkezési felületet
+    // ad vissza a server. A "Login or register" / "Subscribe to continue"
+    // ÉS rövid markdown együtt = paywall.
+    const paywallPatterns = [
+      'Subscribe to continue reading',
+      'Sign in to continue',
+      'Please log in to continue',
+      'To continue reading, subscribe',
+    ];
+    if (paywallPatterns.some(s => md.includes(s)) && len < 800) {
+      return { usable: false, reason: 'paywall_banner', markdown_len: len };
+    }
+    return { usable: true, reason: null, markdown_len: len };
+  }
+
+  // Payload-builder: bármely scrape-result-hez hozzá ad content_usable +
+  // block_reason mezőket. Stub-tartalom esetén a markdown-ra warning-flag
+  // kerül, a title kiürítve hogy a kliens ne idézze tévedésből.
+  _decorateContentFlags(result, override_reason = null) {
+    if (!result) return result;
+    const eval_ = this._evaluateContent(result);
+    const decorated = { ...result };
+    decorated.content_usable = eval_.usable;
+    decorated.block_reason = override_reason || eval_.reason;
+    if (!eval_.usable) {
+      decorated.markdown_warning = 'CONTENT_STUB_DO_NOT_QUOTE';
+      // Title-cleanup: ne maradjon a domain-név mint "title", mert
+      // megtévesztő — az agent cikkcímként idézhetné.
+      if (decorated.title && decorated.title.length < 60 &&
+          !decorated.title.includes(' ')) {
+        decorated.title = '';
+      }
+    }
+    return decorated;
   }
 
   async _scrapeAutoEscalation(url, options = {}) {
@@ -1615,106 +1664,130 @@ export class BraveController {
     delete baseOptions.stealth;
     delete baseOptions.flaresolverr;
 
-    // ── Szint 1: default scrape ────────────────────────────────────────
+    const trackBest = (r) => {
+      if ((r?.markdown || '').length > (best?.markdown || '').length) best = r;
+    };
+
+    const finalize = (winning, lvl_path) => {
+      const { _flaresolverr_session, ...clean } = winning || { url, markdown: '', text: '' };
+      const decorated = this._decorateContentFlags(clean);
+      return { ...decorated, escalation_path: lvl_path };
+    };
+
+    // ── Szint 1: default scrape (~5s) ──────────────────────────────────
     try {
       const r1 = await this.scrape(url, { ...baseOptions });
-      escalation_path.push({
-        level: 1, mode: 'default',
-        ok: !this._isBlockedOrEmpty(r1),
-        md_len: (r1?.markdown || r1?.text || '').length,
-        cf_status: r1?.cf_status,
-      });
-      if (!this._isBlockedOrEmpty(r1)) {
-        return { ...r1, escalation_path };
-      }
-      best = r1;
+      const eval1 = this._evaluateContent(r1);
+      escalation_path.push({ level: 1, mode: 'default',
+        ok: eval1.usable, md_len: eval1.markdown_len,
+        cf_status: r1?.cf_status, block_reason: eval1.reason });
+      if (eval1.usable) return finalize(r1, escalation_path);
+      trackBest(r1);
     } catch (e) {
       escalation_path.push({ level: 1, mode: 'default', error: e.message });
     }
 
-    // ── Szint 2: stealth ───────────────────────────────────────────────
+    // ── Szint 2: stealth (~5-19s) ──────────────────────────────────────
     try {
       const r2 = await this.scrape(url, { ...baseOptions, stealth: true });
-      escalation_path.push({
-        level: 2, mode: 'stealth',
-        ok: !this._isBlockedOrEmpty(r2),
-        md_len: (r2?.markdown || r2?.text || '').length,
-        cf_status: r2?.cf_status,
-      });
-      if (!this._isBlockedOrEmpty(r2)) {
-        return { ...r2, escalation_path };
-      }
-      // Tartsuk a leg-hosszabb tartalmat fallback-nek
-      if ((r2?.markdown || '').length > (best?.markdown || '').length) best = r2;
+      const eval2 = this._evaluateContent(r2);
+      escalation_path.push({ level: 2, mode: 'stealth',
+        ok: eval2.usable, md_len: eval2.markdown_len,
+        cf_status: r2?.cf_status, block_reason: eval2.reason });
+      if (eval2.usable) return finalize(r2, escalation_path);
+      trackBest(r2);
     } catch (e) {
       escalation_path.push({ level: 2, mode: 'stealth', error: e.message });
     }
 
-    // ── Szint 3: FlareSolverr direct ───────────────────────────────────
-    if (!process.env.FLARESOLVERR_URL) {
-      escalation_path.push({
-        level: 3, mode: 'flaresolverr',
-        skipped: 'FLARESOLVERR_URL not configured',
-      });
-      return { ...(best || { url, markdown: '', text: '' }), escalation_path,
-               cf_status: best?.cf_status || 'all_levels_blocked' };
-    }
-
-    let r3;
-    try {
-      r3 = await this._scrapeViaFlareSolverr(url, baseOptions);
-      escalation_path.push({
-        level: 3, mode: 'flaresolverr',
-        ok: !this._isBlockedOrEmpty(r3),
-        md_len: (r3?.markdown || r3?.text || '').length,
-        cf_status: r3?.cf_status,
-      });
-      if (!this._isBlockedOrEmpty(r3)) {
-        // Tisztítsuk a belső _flaresolverr_session-t a publikus payloadból
-        const { _flaresolverr_session, ...clean } = r3;
-        return { ...clean, escalation_path };
+    // ── Szint 3: FlareSolverr direct (~30-90s) ─────────────────────────
+    let r3 = null;
+    if (process.env.FLARESOLVERR_URL) {
+      try {
+        r3 = await this._scrapeViaFlareSolverr(url, baseOptions);
+        const eval3 = this._evaluateContent(r3);
+        escalation_path.push({ level: 3, mode: 'flaresolverr',
+          ok: eval3.usable, md_len: eval3.markdown_len,
+          cf_status: r3?.cf_status, block_reason: eval3.reason });
+        if (eval3.usable) return finalize(r3, escalation_path);
+        trackBest(r3);
+      } catch (e) {
+        escalation_path.push({ level: 3, mode: 'flaresolverr', error: e.message });
       }
-      if ((r3?.markdown || '').length > (best?.markdown || '').length) best = r3;
-    } catch (e) {
-      escalation_path.push({ level: 3, mode: 'flaresolverr', error: e.message });
+    } else {
+      escalation_path.push({ level: 3, mode: 'flaresolverr',
+        skipped: 'FLARESOLVERR_URL not configured' });
     }
 
     // ── Szint 4: FlareSolverr session → Puppeteer-render ──────────────
-    // A FlareSolverr `solution.cookies`+`solution.userAgent`-jét vesszük át,
-    // és egy saját Puppeteer-page-en NYITJUK MEG az URL-t. A JS lefut, a
-    // SPA-AJAX-ok renderelődnek. Az identikus UA+cookies tipikusan elég
-    // hogy a Cloudflare-réteg ne dobjon vissza Turnstile-ra. (Az IP-szintű
-    // ellenőrzés viszont kockázat — ha eldobja, fallback a r3-as eredményre.)
     const session = r3?._flaresolverr_session;
-    if (!session || !Array.isArray(session.cookies) || !session.cookies.length) {
-      escalation_path.push({
-        level: 4, mode: 'flaresolverr_render',
-        skipped: 'no usable FlareSolverr session',
-      });
-      const { _flaresolverr_session, ...clean } = best || {};
-      return { ...clean, escalation_path,
-               cf_status: best?.cf_status || 'all_levels_blocked' };
-    }
-
-    try {
-      const r4 = await this._renderWithFlareSolverrSession(url, session, baseOptions);
-      escalation_path.push({
-        level: 4, mode: 'flaresolverr_render',
-        ok: !this._isBlockedOrEmpty(r4),
-        md_len: (r4?.markdown || r4?.text || '').length,
-        cf_status: r4?.cf_status,
-      });
-      if (!this._isBlockedOrEmpty(r4)) {
-        return { ...r4, escalation_path };
+    if (session && Array.isArray(session.cookies) && session.cookies.length) {
+      try {
+        const r4 = await this._renderWithFlareSolverrSession(url, session, baseOptions);
+        const eval4 = this._evaluateContent(r4);
+        escalation_path.push({ level: 4, mode: 'flaresolverr_render',
+          ok: eval4.usable, md_len: eval4.markdown_len,
+          cf_status: r4?.cf_status, block_reason: eval4.reason });
+        if (eval4.usable) return finalize(r4, escalation_path);
+        trackBest(r4);
+      } catch (e) {
+        escalation_path.push({ level: 4, mode: 'flaresolverr_render', error: e.message });
       }
-      if ((r4?.markdown || '').length > (best?.markdown || '').length) best = r4;
-    } catch (e) {
-      escalation_path.push({ level: 4, mode: 'flaresolverr_render', error: e.message });
+    } else {
+      escalation_path.push({ level: 4, mode: 'flaresolverr_render',
+        skipped: 'no usable FlareSolverr session' });
     }
 
-    // Minden szint blocked. Visszaadjuk a leg-hosszabb tartalmat + escalation_path.
-    const { _flaresolverr_session, ...clean } = best || { url, markdown: '', text: '' };
-    return { ...clean, escalation_path, cf_status: 'all_levels_blocked' };
+    // ── Szint 5: Wayback Machine cache (anti-bot-mentes) ──────────────
+    // A web.archive.org cache-elt verziókat tárol szinte az ÖSSZES mainstream
+    // hírforrásból. Nincs Cloudflare, nincs Turnstile, nincs paywall (a cache
+    // a pre-paywall verziót őrzi). Ez sokszor az utolsó működő út a Reuters /
+    // FT / WSJ / NYT / WaPo-szintű kemény oldalakon.
+    try {
+      const wbUrl = `https://web.archive.org/web/${url}`;
+      const r5 = await this.scrape(wbUrl, { ...baseOptions });
+      const eval5 = this._evaluateContent(r5);
+      escalation_path.push({ level: 5, mode: 'wayback_machine',
+        ok: eval5.usable, md_len: eval5.markdown_len, block_reason: eval5.reason });
+      if (eval5.usable) {
+        // Az original-URL-t adjuk vissza a kliensnek, a wayback wrapper-t elrejtjük
+        // (de a metadata-ban marked: source = 'wayback_machine')
+        const r5fin = { ...r5, url, original_scrape_url: wbUrl, content_source: 'wayback_machine' };
+        return finalize(r5fin, escalation_path);
+      }
+      trackBest(r5);
+    } catch (e) {
+      escalation_path.push({ level: 5, mode: 'wayback_machine', error: e.message });
+    }
+
+    // ── Szint 6: Google AMP mirror ─────────────────────────────────────
+    // Az AMP-verzió sok mainstream news-cikknél elérhető és nincs paywall.
+    // A google.com/amp/s/<host>/<path> trükkel a Google-cache-AMP-renderét
+    // hívjuk. Sokszor utolsó cseppet ad a Reuters / Bloomberg / FT cikkekhez.
+    try {
+      const u = new URL(url);
+      const ampUrl = `https://www.google.com/amp/s/${u.host}${u.pathname}${u.search}`;
+      const r6 = await this.scrape(ampUrl, { ...baseOptions, stealth: true });
+      const eval6 = this._evaluateContent(r6);
+      escalation_path.push({ level: 6, mode: 'google_amp',
+        ok: eval6.usable, md_len: eval6.markdown_len, block_reason: eval6.reason });
+      if (eval6.usable) {
+        const r6fin = { ...r6, url, original_scrape_url: ampUrl, content_source: 'google_amp' };
+        return finalize(r6fin, escalation_path);
+      }
+      trackBest(r6);
+    } catch (e) {
+      escalation_path.push({ level: 6, mode: 'google_amp', error: e.message });
+    }
+
+    // ── Minden szint blocked ───────────────────────────────────────────
+    const failed = best || { url, markdown: '', text: '', cf_status: 'all_levels_blocked' };
+    const { _flaresolverr_session, ...clean } = failed;
+    return {
+      ...this._decorateContentFlags(clean, 'all_levels_blocked'),
+      cf_status: 'all_levels_blocked',
+      escalation_path,
+    };
   }
 
   async _renderWithFlareSolverrSession(url, session, options = {}) {
@@ -1773,7 +1846,7 @@ export class BraveController {
       const markdown = this.turndownService.turndown(bodyHtml);
       const text = $('body').text().replace(/\s+/g, ' ').trim();
 
-      return {
+      const result = {
         url: page.url(),
         title: metadata.title,
         metadata,
@@ -1783,6 +1856,7 @@ export class BraveController {
         screenshot: screenshot ? `data:image/png;base64,${screenshot}` : undefined,
         cf_status: 'via_flaresolverr_render',
       };
+      return this._decorateContentFlags(result);
     } finally {
       await page.close();
     }
