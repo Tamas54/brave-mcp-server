@@ -1,7 +1,7 @@
 export const tools = [
   {
     name: 'brave_scrape',
-    description: 'Weboldal tartalmának scrape-elése Brave böngészővel',
+    description: 'Weboldal tartalmának scrape-elése Brave böngészővel (puppeteer-extra + StealthPlugin). Opt-in "stealth" mód a Cloudflare-fal mögötti oldalakhoz.',
     handler: 'tools/call',
     inputSchema: {
       type: 'object',
@@ -25,6 +25,10 @@ export const tools = [
         includeHtml: {
           type: 'boolean',
           description: 'Teljes HTML tartalom visszaadása'
+        },
+        stealth: {
+          type: 'boolean',
+          description: 'Fejlett anti-bot mód: UA + viewport randomizáció, per-domain cookie-jar (cf_clearance őrzés), Cloudflare-challenge auto-resolve. Bekapcsolva, ha az alap scrape egy Cloudflare-falba ütközött ("Just a moment", "Verify you are human"). Default: false (gyors path, 0 extra overhead). Lassít ~50ms a happy-path-on, +14s worst-case challenge esetén.'
         }
       },
       required: ['url']

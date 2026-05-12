@@ -35,13 +35,23 @@ export class BraveController {
     this.browser = await puppeteer.launch({
       executablePath: bravePath,
       headless: process.env.HEADLESS === 'true' ? 'new' : false,
+      // Erősített launch — Cloudflare TLS-fingerprint + viselkedés-detektor
+      // ellenére is átmenős. A StealthPlugin a Runtime-szintű leakeket fedi,
+      // ezek a flag-ek a Chrome-szintű automatizáció-jeleket tüntetik el.
+      ignoreDefaultArgs: ['--enable-automation'],
       args: [
         '--disable-blink-features=AutomationControlled',
-        '--disable-features=site-per-process',
+        '--disable-features=site-per-process,IsolateOrigins,AutomationControlled',
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-web-security',
-        '--disable-dev-shm-usage'
+        '--disable-dev-shm-usage',
+        '--disable-infobars',
+        '--disable-extensions-except=',
+        '--lang=en-US,en',
+        '--window-size=1920,1080',
+        '--start-maximized',
+        '--enable-features=NetworkService,NetworkServiceInProcess',
       ]
     });
   }
@@ -79,15 +89,48 @@ export class BraveController {
 
   async scrape(url, options = {}) {
     const page = await this.browser.newPage();
-    
+
+    // ─── STEALTH MODE — opt-in, opciós paraméter ────────────────────────
+    // options.stealth === true esetén:
+    //   • UA + viewport randomizáció (Chrome 120-122 variants)
+    //   • Per-domain cookie-jar load/save (Cloudflare cf_clearance őrzés)
+    //   • Cloudflare-challenge auto-resolve (8s wait + retry)
+    //   • Bővített HTTP-headers
+    // Default (stealth=false): a gyors, jelenlegi viselkedés — minimális
+    // overhead. A statdata-jellegű JS-rendered forrásokra (Eurostat,
+    // MNB, ECB, DBnomics) ez tökéletes, mert ott nincs anti-bot-fal.
+    const stealthMode = options.stealth === true;
+
     try {
-      // User agent beállítása
-      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-      
+      if (stealthMode) {
+        // Random UA + viewport — Cloudflare TLS-fingerprint statisztikát megtöri.
+        const ua = BraveController.UA_POOL[
+          Math.floor(Math.random() * BraveController.UA_POOL.length)
+        ];
+        await page.setUserAgent(ua);
+        await page.setViewport({
+          width: 1366 + Math.floor(Math.random() * 200),
+          height: 768 + Math.floor(Math.random() * 200),
+        });
+        // Extra fejlécek — egyes Cloudflare-fogadópontok ezeket figyelik.
+        await page.setExtraHTTPHeaders({
+          'Accept-Language': 'en-US,en;q=0.9,hu;q=0.8',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          'Upgrade-Insecure-Requests': '1',
+        });
+        // Per-domain cookie-jar load — Cloudflare cf_clearance és társai.
+        // Egy korábban megnyert challenge ~30 perc – 2 óra élethosszú, így a
+        // következő scrape-ek azonnal átmennek.
+        await this._loadDomainCookies(page, url);
+      } else {
+        // Default fast-path UA — a meglévő viselkedés (statdata path)
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+      }
+
       // Navigálás
-      await page.goto(url, { 
+      await page.goto(url, {
         waitUntil: options.waitUntil || 'networkidle2',
-        timeout: options.timeout || 30000 
+        timeout: options.timeout || 30000
       });
 
       // Várakozás további tartalomra
@@ -96,20 +139,59 @@ export class BraveController {
       }
 
       if (options.waitTime) {
-        await page.waitForTimeout(options.waitTime);
+        await BraveController._sleep(options.waitTime);
+      }
+
+      // ─── Cloudflare-challenge auto-resolve — CSAK STEALTH MODE-BAN ─────
+      // Default módon a happy-path-ot semmi nem lassítja. Egyetlen retry,
+      // max 6s nav-timeout → worst-case +14s per scrape (csak ha CF challenge
+      // tényleg ott van). Konzervatív indikátor-lista a `_isCloudflareChallenge`
+      // helperben — false-positive minimalizálva.
+      let cfStatus = stealthMode ? 'none' : 'skipped';
+      let html = await page.content();
+      if (stealthMode && this._isCloudflareChallenge(html)) {
+        cfStatus = 'attempt_1';
+        console.log('[CF] Challenge detected, waiting 8s for auto-resolve...');
+        // Kis emberi mozgás — Cloudflare behaviour-score-ját lendíti
+        try {
+          await page.mouse.move(
+            300 + Math.random() * 400,
+            200 + Math.random() * 400,
+            { steps: 10 }
+          );
+        } catch (_) {}
+        await BraveController._sleep(8000);
+        try {
+          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 6000 });
+        } catch (_) {
+          // Nincs új navigáció — a content() újraolvasása viszont kötelező
+        }
+        html = await page.content();
+        if (!this._isCloudflareChallenge(html)) {
+          cfStatus = 'cleared_attempt_1';
+          console.log('[CF] Challenge cleared on attempt 1');
+        } else {
+          cfStatus = 'blocked';
+          console.log('[CF] Still blocked after 1 attempt');
+        }
+      }
+
+      // Cookie-jar save — csak stealth módban, ha bármi clearance cookie
+      // keletkezett. Default módban nem mentünk semmit.
+      if (stealthMode) {
+        await this._saveDomainCookies(page, url);
       }
 
       // Screenshot készítése ha kell
       let screenshot = null;
       if (options.screenshot) {
-        screenshot = await page.screenshot({ 
-          fullPage: true, 
-          encoding: 'base64' 
+        screenshot = await page.screenshot({
+          fullPage: true,
+          encoding: 'base64'
         });
       }
 
-      // Tartalom kinyerése
-      const html = await page.content();
+      // Tartalom kinyerése (stealth retry már frissítette a html-t)
       const $ = cheerio.load(html);
       
       // Metadata gyűjtése
@@ -149,7 +231,9 @@ export class BraveController {
         text,
         html: options.includeHtml ? html : undefined,
         links: options.includeLinks ? links : undefined,
-        screenshot: screenshot ? `data:image/png;base64,${screenshot}` : undefined
+        screenshot: screenshot ? `data:image/png;base64,${screenshot}` : undefined,
+        // cf_status: 'none' | 'cleared_attempt_N' | 'blocked' — kliens-side telemetria
+        cf_status: cfStatus,
       };
 
     } finally {
@@ -1242,17 +1326,17 @@ export class BraveController {
 
   async clearSessions(site) {
     const sessionsDir = path.join(process.cwd(), '.sessions');
-    
+
     try {
       if (site === 'all') {
-        // Töröljük az összes session-t
+        // Töröljük az összes session-t (login + cookie-jar)
         const files = await fs.readdir(sessionsDir);
         for (const file of files) {
-          if (file.endsWith('_session.json')) {
+          if (file.endsWith('_session.json') || file.startsWith('_cookies_')) {
             await fs.unlink(path.join(sessionsDir, file));
           }
         }
-        return { success: true, message: 'Minden session törölve' };
+        return { success: true, message: 'Minden session + cookie-jar törölve' };
       } else {
         // Csak egy specifikus site session-jét töröljük
         const sessionPath = path.join(sessionsDir, `${site}_session.json`);
@@ -1266,4 +1350,88 @@ export class BraveController {
       throw error;
     }
   }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  CLOUDFLARE / ANTI-BOT FALLBACK HELPERS — 2026-05-12
+  // ════════════════════════════════════════════════════════════════════
+
+  // Per-domain cookie-jar — Cloudflare cf_clearance és társai. 30 perc – 2 óra
+  // életű, mégis sokat segít: egy egyszer megnyert challenge után ~10x scrape
+  // megy fenntartás nélkül a Stealth-pipeline-on.
+  async _loadDomainCookies(page, url) {
+    try {
+      const domain = new URL(url).hostname;
+      const cookiePath = path.join(process.cwd(), '.sessions', `_cookies_${domain}.json`);
+      const data = await fs.readFile(cookiePath, 'utf-8').catch(() => null);
+      if (!data) return false;
+      const payload = JSON.parse(data);
+      // 2 órán túli cookie-jart ne erőltessünk — cf_clearance amúgy is lejár
+      const age = Date.now() - (payload.timestamp || 0);
+      if (age > 2 * 60 * 60 * 1000) return false;
+      if (Array.isArray(payload.cookies) && payload.cookies.length) {
+        await page.setCookie(...payload.cookies);
+        return true;
+      }
+    } catch (_) {
+      // first-visit / corrupt — silent fall-through
+    }
+    return false;
+  }
+
+  async _saveDomainCookies(page, url) {
+    try {
+      const domain = new URL(url).hostname;
+      const cookies = await page.cookies();
+      if (!cookies || !cookies.length) return;
+      const cookiePath = path.join(process.cwd(), '.sessions', `_cookies_${domain}.json`);
+      await fs.mkdir(path.dirname(cookiePath), { recursive: true });
+      await fs.writeFile(
+        cookiePath,
+        JSON.stringify({ domain, timestamp: Date.now(), cookies }, null, 2),
+      );
+    } catch (e) {
+      console.warn(`[cookie-jar] save failed for ${url}: ${e.message}`);
+    }
+  }
+
+  // HTML-pattern matcher: Cloudflare Just-a-moment / Turnstile / generic
+  // anti-bot challenge oldalak felismerése. Konzervatív — csak akkor true,
+  // ha biztos challenge-page, nem egy random "javascript" szóelőfordulás.
+  _isCloudflareChallenge(html) {
+    if (!html || typeof html !== 'string') return false;
+    // Konzervatív indikátor-lista: csak olyan stringek, amik kizárólag aktív
+    // CF challenge-page-en jelennek meg. "Cloudflare Ray ID" SZÁNDÉKOSAN
+    // kimaradt — sok normál CF-protected oldal (statdata-jellegű) is mutatja
+    // a footer-ben, de NINCS challenge → false positive lenne, és 14s extra
+    // wait minden statdata-scrape-en. Lassítás-kockázatot kerüljük.
+    const indicators = [
+      'Just a moment',
+      'cf-challenge',
+      'challenge-platform',
+      'cf_chl_opt',
+      'Checking your browser before accessing',
+      'unusual activity from your computer',
+      'Please enable JavaScript and cookies to continue',
+      'Verifying you are human',
+      'Verify you are human',
+    ];
+    return indicators.some(s => html.includes(s));
+  }
+
+  static _sleep(ms) {
+    return new Promise(r => setTimeout(r, ms));
+  }
 }
+
+// User-Agent pool — Chrome 120-122 desktop variants (Win/Mac/Linux). A scrape()
+// minden hívásnál véletlenszerűt választ → a TLS-fingerprint statisztika nem
+// detektálható "always-same-bot"-ként.
+BraveController.UA_POOL = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+];
