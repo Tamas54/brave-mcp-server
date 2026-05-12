@@ -1,4 +1,5 @@
-import puppeteer from 'puppeteer-extra';
+import { addExtra } from 'puppeteer-extra';
+import rebrowserPuppeteer from 'rebrowser-puppeteer';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import TurndownService from 'turndown';
 import * as cheerio from 'cheerio';
@@ -13,7 +14,12 @@ const require = createRequire(import.meta.url);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Stealth plugin hozzáadása
+// 2026-05-12 upgrade: a klasszikus `puppeteer` (v19) helyett `rebrowser-puppeteer`
+// drop-in csere. Ugyanaz az API, de CDP-szintű leakeket is befedi (Runtime.enable
+// detect, Source.URL stack, stb.) — jelentősen erősebb a 2024+ Cloudflare Turnstile
+// és más viselkedés-elemző anti-bot pipeline-ok ellen. A StealthPlugin réteg
+// FÖLÖTTE marad — a két javítás kumulált.
+const puppeteer = addExtra(rebrowserPuppeteer);
 puppeteer.use(StealthPlugin());
 
 export class BraveController {
