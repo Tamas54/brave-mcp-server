@@ -17,6 +17,31 @@ let braveController = null;
 const app = express();
 const PORT = process.env.PORT || process.env.HTTP_PORT || 3000;
 
+// === Stability knobs (2026-05-14 stability plan) ===
+// Hard ceiling for tools/call wall-clock. Anything that takes longer is
+// almost certainly a leaked Puppeteer page or stuck FlareSolverr call;
+// we return a JSONRPC error instead of letting the client hang 30+s.
+const TOOL_CALL_TIMEOUT_MS = parseInt(
+  process.env.TOOL_CALL_TIMEOUT_MS || '25000', 10
+);
+// Deep healthcheck: probes brave_search end-to-end so Railway can spot
+// the "/health works but tools/call hangs" failure mode.
+const HEALTH_DEEP_TIMEOUT_MS = parseInt(
+  process.env.HEALTH_DEEP_TIMEOUT_MS || '8000', 10
+);
+const HEALTH_DEEP_CACHE_MS = parseInt(
+  process.env.HEALTH_DEEP_CACHE_MS || '30000', 10
+);
+let _deepCache = { ts: 0, ok: true, reason: '' };
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 // CORS és JSON middleware
 app.use(cors({
   origin: '*',
@@ -90,13 +115,63 @@ app.get('/.well-known/openid_configuration', (req, res) => {
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     server: 'brave-mcp-server',
     version: '2.0.0',
     timestamp: new Date().toISOString(),
     auth: 'optional'
   });
+});
+
+// Deep health check — probes brave_search end-to-end and reports 503 if
+// the inner tools/call layer is stuck. Result is cached for
+// HEALTH_DEEP_CACHE_MS so Railway healthchecks don't hammer Brave-Search.
+//
+// Use this path in railway.json `healthcheckPath` so Railway auto-
+// restarts the container when the deep probe fails — the "/health
+// works but tools/call hangs" failure mode (observed 2026-05-14)
+// becomes self-healing.
+app.get('/health/deep', async (req, res) => {
+  const now = Date.now();
+  if (now - _deepCache.ts < HEALTH_DEEP_CACHE_MS) {
+    return res.status(_deepCache.ok ? 200 : 503).json({
+      status: _deepCache.ok ? 'ok' : 'degraded',
+      cached: true,
+      reason: _deepCache.reason,
+      age_ms: now - _deepCache.ts,
+      timestamp: new Date().toISOString(),
+    });
+  }
+  try {
+    if (!braveController) {
+      braveController = new BraveController();
+      await braveController.initialize();
+    }
+    const tool = tools.find(t => t.name === 'brave_search');
+    if (!tool) throw new Error('brave_search tool not registered');
+    await withTimeout(
+      tool.execute(braveController, { query: 'hello', limit: 1 }),
+      HEALTH_DEEP_TIMEOUT_MS,
+      'deep-health brave_search'
+    );
+    _deepCache = { ts: now, ok: true, reason: '' };
+    res.json({
+      status: 'ok',
+      cached: false,
+      probe_timeout_ms: HEALTH_DEEP_TIMEOUT_MS,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    _deepCache = { ts: now, ok: false, reason: err.message };
+    console.error('⚠️ Deep healthcheck failed:', err.message);
+    res.status(503).json({
+      status: 'degraded',
+      reason: err.message,
+      cached: false,
+      timestamp: new Date().toISOString(),
+    });
+  }
 });
 
 // Tools list endpoint
@@ -248,8 +323,31 @@ app.post('/mcp', async (req, res) => {
       // MCP standard: params = { name, arguments }; tools expect arguments-t.
       // 2026-05-10 fix — addig az egész params-ot adta át, így pl. a brave_scrape
       // params.url helyett params.arguments.url-ben kapta az URL-t és undefined volt.
+      // 2026-05-14: wrap in TOOL_CALL_TIMEOUT_MS so a single stuck Puppeteer
+      // page can't hang the request 30+s. Returns explicit JSONRPC -32000.
       const args = params?.arguments ?? {};
-      const result = await tool.execute(braveController, args);
+      let result;
+      try {
+        result = await withTimeout(
+          tool.execute(braveController, args),
+          TOOL_CALL_TIMEOUT_MS,
+          `tools/call ${toolName}`
+        );
+      } catch (err) {
+        if (String(err.message || '').includes('timeout')) {
+          console.error(`⏱️ Tool ${toolName} timed out after ${TOOL_CALL_TIMEOUT_MS}ms`);
+          return res.status(504).json({
+            jsonrpc: '2.0',
+            id,
+            error: {
+              code: -32000,
+              message: `Tool ${toolName} timeout after ${TOOL_CALL_TIMEOUT_MS}ms`,
+              data: { tool: toolName, timeout_ms: TOOL_CALL_TIMEOUT_MS }
+            }
+          });
+        }
+        throw err;
+      }
 
       return res.json({
         jsonrpc: '2.0',
