@@ -89,11 +89,17 @@ process.stdin.on('data', async (data) => {
 console.error('🚀 Brave MCP STDIO Server started');
 console.error('📡 Waiting for JSON-RPC requests...');
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.error('🛑 Shutting down...');
+// Graceful shutdown — SIGTERM IS (supervisor/konténer SIGTERM-et küld), különben
+// a Chromium gyerekek árván maradnak.
+let _shuttingDown = false;
+const shutdown = async (sig) => {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  console.error(`🛑 ${sig} — Shutting down...`);
   if (braveController) {
-    await braveController.close();
+    try { await braveController.close(); } catch (e) { console.error('browser close hiba:', e); }
   }
   process.exit(0);
-});
+};
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));

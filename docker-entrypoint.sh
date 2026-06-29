@@ -31,6 +31,9 @@ done
 # Trap signals so SIGTERM also kills Webclaw side-car
 trap 'echo "[entrypoint] stopping..."; kill -TERM "$WEBCLAW_PID" 2>/dev/null; wait "$WEBCLAW_PID" 2>/dev/null; exit 0' TERM INT
 
-# Replace shell with brave-mcp-server (PID 1)
-echo "[entrypoint] starting brave-mcp-server (npm run http)..."
-exec npm run http
+# Replace shell with brave-mcp-server (PID 1).
+# KÖZVETLEN node (NEM `npm run http`): az npm gyakran NEM továbbítja a SIGTERM-et
+# a gyerek node-nak -> a graceful shutdown (browser.close) el sem sülne, a Chromium
+# gyerekek árván maradnának. Így a node a PID 1, és közvetlenül kapja a SIGTERM-et.
+echo "[entrypoint] starting brave-mcp-server (node dual-server --http-only)..."
+exec node src/dual-server.js --http-only

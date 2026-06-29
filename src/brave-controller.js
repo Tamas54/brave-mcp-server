@@ -25,6 +25,7 @@ puppeteer.use(StealthPlugin());
 export class BraveController {
   constructor() {
     this.browser = null;
+    this._initPromise = null;   // ensureBrowser verseny-lock (egyszerre 1 launch)
     this.turndownService = new TurndownService({
       headingStyle: 'atx',
       codeBlockStyle: 'fenced',
@@ -38,7 +39,7 @@ export class BraveController {
   async initialize() {
     const bravePath = process.env.BRAVE_PATH || this.detectBravePath();
     
-    this.browser = await puppeteer.launch({
+    const launched = await puppeteer.launch({
       executablePath: bravePath,
       headless: process.env.HEADLESS === 'true' ? 'new' : false,
       // Erősített launch — Cloudflare TLS-fingerprint + viselkedés-detektor
@@ -50,6 +51,7 @@ export class BraveController {
         '--disable-features=site-per-process,IsolateOrigins,AutomationControlled',
         '--no-sandbox',
         '--disable-setuid-sandbox',
+        '--disable-gpu',
         '--disable-web-security',
         '--disable-dev-shm-usage',
         '--disable-infobars',
@@ -60,6 +62,129 @@ export class BraveController {
         '--enable-features=NetworkService,NetworkServiceInProcess',
       ]
     });
+    this.browser = launched;
+
+    // 2026-06-29: ha a Chromium meghal, a this.browser stale handle marad -> a
+    // disconnected-handler nullázza, így a következő ensureBrowser() újraépíti
+    // (zombi-szerver ellen). A `=== launched` guard: egy ÁRVA/régi böngésző
+    // disconnect-je NE nullázza a frissen indítottat (verseny-védelem).
+    launched.on('disconnected', () => { if (this.browser === launched) this.browser = null; });
+  }
+
+  // 2026-06-29: STATEFUL navigáció a PERZISZTENS lapon (getCurrentPage).
+  // A scrape eldobható lapot nyit+zár (lőj-és-felejts), ezért a vizuális/egér
+  // toolok eddig egy üres about:blank lapot kaptak. Ez a tool a perzisztens
+  // lapot viszi az URL-re és NYITVA hagyja → navigate → visual_inspect →
+  // mouse_control mind ugyanazon a látható oldalon dolgozik.
+  async navigate(url, options = {}) {
+    await this.ensureBrowser();
+    const pages = await this.browser.pages();
+    const page = pages.length ? pages[pages.length - 1] : await this.newPage();
+    try { await page.bringToFront(); } catch (e) {}
+    await page.goto(url, {
+      waitUntil: options.waitUntil || 'domcontentloaded',
+      timeout: options.timeout || 30000
+    });
+    const wait = options.waitTime ?? 2500;
+    if (wait) await new Promise(r => setTimeout(r, wait));
+    const screenshot = await page.screenshot({ encoding: 'base64' });
+    let title = '';
+    try { title = await page.title(); } catch (e) {}
+    return {
+      success: true,
+      url: page.url(),
+      title,
+      screenshot: `data:image/png;base64,${screenshot}`
+    };
+  }
+
+  // 2026-06-29: SET-OF-MARKS pillanatkép a perzisztens lapról. Kigyűjti a
+  // kattintható elemeket (link/gomb), dedup href szerint, MÉRET szerint
+  // rangsorol (nagy videó-thumbnailek elöl), számozott jelölőket rajzol, és
+  // visszaadja a {n, label, x, y} térképet + a jelölt screenshotot. Így egy
+  // kis modellnek nem pixelt kell becsülnie, csak SZÁMOT választania.
+  async markedSnapshot(options = {}) {
+    const max = options.max || 30;
+    const page = await this.getCurrentPage();
+    let elements = await page.evaluate(() => {
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const seen = new Set();
+      const out = [];
+      const cands = Array.from(document.querySelectorAll(
+        'a[href], button, [role="button"], [role="link"], input[type="submit"], input[type="button"]'
+      ));
+      for (const el of cands) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 30 || rect.height < 15) continue;
+        // teljesen viewporton kívül → kihagy
+        if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) continue;
+        // egész oldalt lefedő overlay → kihagy
+        if (rect.width > vw * 0.97 && rect.height > vh * 0.85) continue;
+        const cx = rect.x + rect.width / 2, cy = rect.y + rect.height / 2;
+        if (cx < 0 || cx > vw || cy < 0 || cy > vh) continue;
+        let label = (el.getAttribute('aria-label') || el.textContent || el.value || '')
+          .replace(/\s+/g, ' ').trim();
+        const href = el.getAttribute('href') || '';
+        const key = href || label;
+        if (!key) continue;
+        if (label.length < 2 && !href) continue;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({ label: label.slice(0, 80), href,
+          x: Math.round(cx), y: Math.round(cy),
+          area: Math.round(rect.width * rect.height) });
+      }
+      return out;
+    });
+    // Azonos href-ű elemek összevonása (thumbnail + cím-link ugyanarra a videóra):
+    // a kattintási pont a LEGNAGYOBB elem közepe, a címke a LEGHOSSZABB szöveg (= cím).
+    const normHref = (h) => {
+      const m = (h || '').match(/[?&]v=([\w-]+)/);
+      return m ? 'v:' + m[1] : (h || '');
+    };
+    const groups = new Map();
+    const singles = [];
+    for (const e of elements) {
+      if (e.href) {
+        const k = normHref(e.href);
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(e);
+      } else {
+        singles.push(e);
+      }
+    }
+    const merged = [];
+    for (const arr of groups.values()) {
+      arr.sort((a, b) => b.area - a.area);
+      const big = arr[0];
+      const label = arr.map(x => x.label).filter(Boolean).sort((a, b) => b.length - a.length)[0] || big.label;
+      merged.push({ label, href: big.href, x: big.x, y: big.y, area: big.area });
+    }
+    elements = merged.concat(singles);
+    // méret szerint csökkenő (nagy thumbnailek elöl), majd limit
+    elements.sort((a, b) => b.area - a.area);
+    elements = elements.slice(0, max);
+    // jelölők kirajzolása
+    await page.evaluate((els) => {
+      els.forEach((e, i) => {
+        const m = document.createElement('div');
+        m.className = 'som-marker';
+        m.style.cssText = `position:fixed;left:${e.x - 16}px;top:${e.y - 13}px;` +
+          `min-width:26px;height:24px;padding:0 4px;background:#ff0033;color:#fff;` +
+          `border:2px solid #fff;border-radius:6px;display:flex;align-items:center;` +
+          `justify-content:center;font:bold 15px sans-serif;z-index:2147483647;` +
+          `pointer-events:none;box-shadow:0 0 5px #000;`;
+        m.textContent = (i + 1);
+        document.body.appendChild(m);
+      });
+    }, elements);
+    const screenshot = await page.screenshot({ encoding: 'base64' });
+    await page.evaluate(() => document.querySelectorAll('.som-marker').forEach(e => e.remove()));
+    return {
+      screenshot: `data:image/png;base64,${screenshot}`,
+      elements: elements.map((e, i) => ({ n: i + 1, label: e.label, href: e.href, x: e.x, y: e.y })),
+      count: elements.length
+    };
   }
 
   detectBravePath() {
@@ -152,7 +277,7 @@ export class BraveController {
       return await this._scrapeViaWebclaw(url, options);
     }
 
-    const page = await this.browser.newPage();
+    const page = await this.newPage();
 
     // ─── STEALTH MODE — opt-in, opciós paraméter ────────────────────────
     // options.stealth === true esetén:
@@ -422,7 +547,7 @@ export class BraveController {
     ];
 
     for (const engine of tries) {
-      const page = await this.browser.newPage();
+      const page = await this.newPage();
       try {
         await page.setUserAgent(
           'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
@@ -452,13 +577,19 @@ export class BraveController {
   }
 
   async close() {
-    if (this.browser) {
-      await this.browser.close();
+    // Idempotens + halott-handle-biztos: előbb nullázunk (a disconnected-handler
+    // és párhuzamos ensureBrowser ne lásson félkész állapotot), a close() hibáját
+    // záráskor nyeljük (egy már levált böngésző close()-a dobhat).
+    const b = this.browser;
+    this.browser = null;
+    this._initPromise = null;
+    if (b) {
+      try { await b.close(); } catch (e) { /* már halott/levált — záráskor irreleváns */ }
     }
   }
 
   async login(params) {
-    const page = await this.browser.newPage();
+    const page = await this.newPage();
     
     try {
       // Human-like behavior
@@ -640,7 +771,7 @@ export class BraveController {
 
   async detectLoginConfig(url) {
     // Intelligent login form detection for custom sites
-    const page = await this.browser.newPage();
+    const page = await this.newPage();
     try {
       await page.goto(url, { waitUntil: 'networkidle2' });
       
@@ -771,7 +902,7 @@ export class BraveController {
         throw new Error('Session expired, please login again');
       }
 
-      const page = await this.browser.newPage();
+      const page = await this.newPage();
       
       // Restore session
       await page.setUserAgent(sessionData.userAgent);
@@ -1385,7 +1516,30 @@ export class BraveController {
     return `${seconds} másodperc`;
   }
 
+  // 2026-06-29: ÖNGYÓGYÍTÁS. Ha nincs böngésző VAGY a kapcsolat megszakadt
+  // (OOM-kill / Chromium-crash / snap profil-lock), a this.browser stale, nem-null
+  // handle marad -> onnantól MINDEN hívás "Protocol error: Connection closed"-dal dől
+  // (zombi szerver). Ez eldobja a stale handle-t és újat épít. Minden lap-nyitó út
+  // ezen megy át (newPage / getCurrentPage / navigate).
+  async ensureBrowser() {
+    if (!this.browser || !this.browser.isConnected()) {
+      // Verseny-lock: ha több egyidejű hívás látja nullnak/halottnak, MIND ugyanazt
+      // az egy initialize()-t várja meg -> nem indul 2 böngésző (ami az árva-disconnect
+      // -> érvényes nullázása churn-t okozná). A finally felszabadítja a következő ciklusra.
+      this._initPromise ??= this.initialize().finally(() => { this._initPromise = null; });
+      await this._initPromise;
+    }
+    return this.browser;
+  }
+
+  // Minden új lap ezen át nyílik -> garantáltan él a böngésző.
+  async newPage() {
+    await this.ensureBrowser();
+    return this.browser.newPage();
+  }
+
   async getCurrentPage() {
+    await this.ensureBrowser();
     const pages = await this.browser.pages();
     return pages[pages.length - 1]; // Utolsó aktív oldal
   }
@@ -2023,7 +2177,7 @@ export class BraveController {
   }
 
   async _renderWithFlareSolverrSession(url, session, options = {}) {
-    const page = await this.browser.newPage();
+    const page = await this.newPage();
     try {
       // Pontos UA + cookies átadás a FlareSolverr session-ből.
       if (session.userAgent) {

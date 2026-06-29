@@ -98,13 +98,17 @@ if (process.argv.includes('--http-only')) {
   startStdioServer();
 }
 
-// Graceful shutdown for STDIO
-process.on('SIGINT', async () => {
-  console.log('🛑 Shutting down STDIO server...');
-  
+// Graceful shutdown for STDIO — SIGTERM IS (dev/supervisor SIGTERM-et küld).
+// (--http-only módban a braveController null marad, a böngészőt a http-server zárja.)
+let _shuttingDown = false;
+const shutdown = async (sig) => {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  console.log(`🛑 ${sig} — Shutting down STDIO server...`);
   if (braveController) {
-    await braveController.close();
+    try { await braveController.close(); } catch (e) { console.error('browser close hiba:', e); }
   }
-  
   process.exit(0);
-});
+};
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));

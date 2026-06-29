@@ -496,18 +496,29 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('🛑 Shutting down server...');
-  
+// Graceful shutdown — SIGTERM IS (Railway/konténer-restart SIGTERM-et küld, nem
+// SIGINT-et!). Ha a browser.close() kimarad, a Chromium gyerekek árván maradnak
+// (snap profil-lock / leaked process / OOM). Ezért MINDKÉT jelre zárunk rendesen.
+let _shuttingDown = false;
+const gracefulShutdown = async (sig) => {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  console.log(`🛑 ${sig} — Shutting down server...`);
+
   if (braveController) {
-    await braveController.close();
+    try { await braveController.close(); } catch (e) { console.error('browser close hiba:', e); }
   }
-  
+
   server.close(() => {
     console.log('✅ Server shut down gracefully');
     process.exit(0);
   });
-});
+  // Hard-fallback: ha a server.close() beragad, 5s után kilépünk (a gyerekek
+  // így is záródtak a browser.close()-zal).
+  setTimeout(() => process.exit(0), 5000).unref();
+};
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 export { app, server };

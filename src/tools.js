@@ -1,5 +1,37 @@
 export const tools = [
   {
+    name: 'brave_navigate',
+    description: 'Megnyit egy URL-t a LÁTHATÓ, perzisztens böngészőlapon és nyitva hagyja, majd visszaad egy képernyőképet. Ezután a brave_visual_inspect és brave_mouse_control UGYANAZON az oldalon dolgozik. Interaktív böngészéshez (kattintás, videó-lejátszás) EZT használd, ne a brave_scrape-et.',
+    handler: 'tools/call',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'A megnyitandó teljes URL (https://...)' },
+        waitTime: { type: 'number', description: 'Várakozás ms-ban a betöltés után (default 2500)' }
+      },
+      required: ['url']
+    },
+    execute: async (controller, params) => {
+      return await controller.navigate(params.url, params);
+    }
+  },
+
+  {
+    name: 'brave_marked_snapshot',
+    description: 'Számozott jelölőket (①②③…) rajzol a perzisztens lap kattintható elemeire, és visszaadja a {n, label, x, y} térképet + a jelölt képernyőképet. Set-of-marks: a kattintáshoz elég a SZÁMOT választani, nem kell pixel-koordinátát becsülni.',
+    handler: 'tools/call',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        max: { type: 'number', description: 'Max jelölt elem (default 30)' }
+      }
+    },
+    execute: async (controller, params) => {
+      return await controller.markedSnapshot(params);
+    }
+  },
+
+  {
     name: 'brave_scrape',
     description: 'Weboldal tartalmának scrape-elése. Default: gyors Puppeteer-Stealth. Az `auto_fallback: true` kapcsolóval a server automatikusan eszkalál (stealth → Webclaw TLS-impersonáció → FlareSolverr → FlareSolverr+render → Wayback → AMP) anti-bot védelem alapján — egy hívás, transzparens 7-szintű chain, `escalation_path` visszacsatolás.',
     handler: 'tools/call',
