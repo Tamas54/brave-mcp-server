@@ -26,6 +26,15 @@ export class BraveController {
   constructor() {
     this.browser = null;
     this._initPromise = null;   // ensureBrowser verseny-lock (egyszerre 1 launch)
+    // 2026-07-01: IZOLÁLT INTERAKTÍV SÁV. A Brave MCP KÉT fogyasztót szolgál ki
+    // EGY Chromiumon: (1) interaktív böngésző CLI-/web-Clausnak, (2) az Echolot
+    // háttér-scrape-je. A régi getCurrentPage() a böngésző ÖSSZES lapja közül az
+    // utolsót adta -> egy Echolot-scrape / YT-popup / target=_blank menet közben
+    // "utolsó lap" lett, és a navigate/inspect/mouse arra ugrott (LAP-DRIFT). Fix:
+    // az interaktív toolok saját BrowserContextben, egy KÖTÖTT lap-referencián
+    // dolgoznak -> sose látják a scrape-sáv lapjait. A scrape-sáv változatlan.
+    this._interactiveCtx = null;   // dedikált BrowserContext az interaktív agentnek
+    this._interactivePage = null;  // kötött lap-referencia (NEM "utolsó lap")
     this.turndownService = new TurndownService({
       headingStyle: 'atx',
       codeBlockStyle: 'fenced',
@@ -68,7 +77,15 @@ export class BraveController {
     // disconnected-handler nullázza, így a következő ensureBrowser() újraépíti
     // (zombi-szerver ellen). A `=== launched` guard: egy ÁRVA/régi böngésző
     // disconnect-je NE nullázza a frissen indítottat (verseny-védelem).
-    launched.on('disconnected', () => { if (this.browser === launched) this.browser = null; });
+    launched.on('disconnected', () => {
+      if (this.browser === launched) {
+        this.browser = null;
+        // A böngésző halálával a context+lap handle-ök is stale-ek -> nullázd,
+        // hogy a getInteractivePage() friss böngészőn újraépítse őket.
+        this._interactiveCtx = null;
+        this._interactivePage = null;
+      }
+    });
   }
 
   // 2026-06-29: STATEFUL navigáció a PERZISZTENS lapon (getCurrentPage).
@@ -77,10 +94,9 @@ export class BraveController {
   // lapot viszi az URL-re és NYITVA hagyja → navigate → visual_inspect →
   // mouse_control mind ugyanazon a látható oldalon dolgozik.
   async navigate(url, options = {}) {
-    await this.ensureBrowser();
-    const pages = await this.browser.pages();
-    const page = pages.length ? pages[pages.length - 1] : await this.newPage();
-    try { await page.bringToFront(); } catch (e) {}
+    url = this._normalizeUrl(url);
+    // Az interaktív sáv KÖTÖTT lapja (nem "utolsó lap") -> nincs lap-drift.
+    const page = await this.getInteractivePage();
     await page.goto(url, {
       waitUntil: options.waitUntil || 'domcontentloaded',
       timeout: options.timeout || 30000
@@ -105,7 +121,7 @@ export class BraveController {
   // kis modellnek nem pixelt kell becsülnie, csak SZÁMOT választania.
   async markedSnapshot(options = {}) {
     const max = options.max || 30;
-    const page = await this.getCurrentPage();
+    const page = await this.getInteractivePage();
     let elements = await page.evaluate(() => {
       const vw = window.innerWidth, vh = window.innerHeight;
       const seen = new Set();
@@ -1021,7 +1037,7 @@ export class BraveController {
 
   // Visual CAPTCHA handling
   async visualCaptcha(params) {
-    const page = await this.getCurrentPage();
+    const page = await this.getInteractivePage();
     
     if (params.action === 'capture') {
       // Teljes képernyőkép a CAPTCHA területről
@@ -1117,8 +1133,12 @@ export class BraveController {
 
   // Mouse control
   async mouseControl(params) {
-    const page = await this.getCurrentPage();
-    
+    const page = await this.getInteractivePage();
+    // 2026-07-01: URL-echo — minden művelet-válaszra rákerül a lap AKTUÁLIS url-je,
+    // hogy egy esetleges drift (action.url ≠ navigate.url) azonnal detektálható/
+    // riasztható legyen. Lustán értékel: a click UTÁNI navigáció is látszik.
+    const echo = (o) => ({ ...o, url: page.url() });
+
     // Track mouse position
     await page.evaluateOnNewDocument(() => {
       window.mouseX = 0;
@@ -1132,40 +1152,40 @@ export class BraveController {
     switch (params.action) {
       case 'move':
         await this.humanMouseMove(page, params.x, params.y);
-        return { success: true, action: 'move', position: { x: params.x, y: params.y } };
+        return echo({ success: true, action: 'move', position: { x: params.x, y: params.y } });
         
       case 'click':
         await this.humanMouseMove(page, params.x, params.y);
         await this.humanDelay(100, 300);
         await page.mouse.click(params.x, params.y);
-        return { success: true, action: 'click', position: { x: params.x, y: params.y } };
+        return echo({ success: true, action: 'click', position: { x: params.x, y: params.y } });
         
       case 'doubleClick':
         await this.humanMouseMove(page, params.x, params.y);
         await page.mouse.click(params.x, params.y, { clickCount: 2 });
-        return { success: true, action: 'doubleClick', position: { x: params.x, y: params.y } };
+        return echo({ success: true, action: 'doubleClick', position: { x: params.x, y: params.y } });
         
       case 'rightClick':
         await this.humanMouseMove(page, params.x, params.y);
         await page.mouse.click(params.x, params.y, { button: 'right' });
-        return { success: true, action: 'rightClick', position: { x: params.x, y: params.y } };
+        return echo({ success: true, action: 'rightClick', position: { x: params.x, y: params.y } });
         
       case 'drag':
         await this.humanMouseMove(page, params.x, params.y);
         await page.mouse.down();
         await this.humanMouseMove(page, params.targetX, params.targetY, params.duration || 1000);
         await page.mouse.up();
-        return { 
-          success: true, 
-          action: 'drag', 
+        return echo({
+          success: true,
+          action: 'drag',
           from: { x: params.x, y: params.y },
           to: { x: params.targetX, y: params.targetY }
-        };
+        });
         
       case 'hover':
         await this.humanMouseMove(page, params.x, params.y);
         await this.humanDelay(params.duration || 1000, params.duration || 1500);
-        return { success: true, action: 'hover', position: { x: params.x, y: params.y } };
+        return echo({ success: true, action: 'hover', position: { x: params.x, y: params.y } });
         
       case 'screenshot_with_cursor':
         // Rajzoljunk egy virtuális kurzort
@@ -1191,21 +1211,24 @@ export class BraveController {
           document.getElementById('virtual-cursor')?.remove();
         });
         
-        return {
+        return echo({
           screenshot: `data:image/png;base64,${screenshot}`,
           cursorPosition: { x: params.x || 0, y: params.y || 0 },
           hint: "Piros pont jelzi a kurzor pozíciót"
-        };
-        
+        });
+
       default:
-        return { success: false, error: 'Ismeretlen művelet' };
+        return echo({ success: false, error: 'Ismeretlen művelet' });
     }
   }
 
   // Visual element inspection
   async visualInspect(params) {
-    const page = await this.getCurrentPage();
-    
+    const page = await this.getInteractivePage();
+    // 2026-07-01: URL-echo — top-level `url` MINDEN mód válaszában, hogy a drift
+    // (inspect.url ≠ navigate.url) azonnal látszódjon, ne csak a pageInfo mélyén.
+    const echo = (o) => ({ url: page.url(), ...o });
+
     if (params.mode === 'full_analysis') {
       // Teljes oldal elemzés
       const analysis = await page.evaluate(() => {
@@ -1280,13 +1303,13 @@ export class BraveController {
       
       const screenshot = await page.screenshot({ encoding: 'base64' });
       
-      return {
+      return echo({
         screenshot: `data:image/png;base64,${screenshot}`,
         interactiveElements: analysis.elements,
         pageInfo: analysis.pageInfo,
         totalElements: analysis.elements.length,
         hint: `Találtam ${analysis.elements.length} interaktív elemet. Használd a koordinátákat a brave_mouse_control tool-lal!`
-      };
+      });
     }
     
     if (params.mode === 'find_element' && params.query) {
@@ -1375,20 +1398,20 @@ export class BraveController {
           document.querySelectorAll('.search-highlight').forEach(el => el.remove());
         });
         
-        return {
+        return echo({
           found: found.length,
           elements: found,
           screenshot: `data:image/png;base64,${screenshot}`,
           suggestion: `Találtam ${found.length} elemet "${params.query}" keresésre. ` +
                      `Az első elem (#1) koordinátái: x=${found[0].center.x}, y=${found[0].center.y}`
-        };
+        });
       }
       
-      return {
+      return echo({
         found: 0,
         elements: [],
         message: `Nem találtam "${params.query}" szöveget tartalmazó elemet az oldalon.`
-      };
+      });
     }
     
     if (params.mode === 'interactive_map') {
@@ -1448,12 +1471,12 @@ export class BraveController {
         document.querySelectorAll('.element-marker').forEach(el => el.remove());
       });
       
-      return {
+      return echo({
         screenshot: `data:image/png;base64,${numberedScreenshot}`,
         elements: numbered,
         totalElements: numbered.length,
         hint: "Minden kattintható elem meg van számozva. Használd a számot vagy a koordinátákat a kattintáshoz!"
-      };
+      });
     }
   }
 
@@ -1541,7 +1564,38 @@ export class BraveController {
   async getCurrentPage() {
     await this.ensureBrowser();
     const pages = await this.browser.pages();
-    return pages[pages.length - 1]; // Utolsó aktív oldal
+    return pages[pages.length - 1]; // Utolsó aktív oldal (LEGACY — scrape-sáv)
+  }
+
+  // 2026-07-01: az INTERAKTÍV sáv lapja. Saját BrowserContextben él, KÖTÖTT
+  // referenciaként -> a navigate/inspect/mouse/marked_snapshot mind PONTOSAN ezt
+  // a lapot célozza, függetlenül attól, hány lapot nyit közben az Echolot-scrape.
+  // Öngyógyító: ha a böngésző/kontextus/lap meghalt, újraépíti (a stale handle-ök
+  // nullázását a disconnected-handler végzi). Így a lap-drift STRUKTURÁLISAN
+  // lehetetlen: nem "utolsó lapot" tippelünk, hanem a sajátunkat tartjuk kézben.
+  async getInteractivePage() {
+    await this.ensureBrowser();
+    // Kontextus: dedikált, elkülönítve az alap (scrape) kontextustól.
+    // createBrowserContext = izolált (incognito) context; a régebbi puppeteer
+    // createIncognitoBrowserContext néven ismeri -> mindkettőre felkészülünk.
+    if (!this._interactiveCtx) {
+      this._interactiveCtx = this.browser.createBrowserContext
+        ? await this.browser.createBrowserContext()
+        : await this.browser.createIncognitoBrowserContext();
+    }
+    // Lap: kötött referencia. Ha bezárták/elszállt, nyiss frisset a SAJÁT contextben.
+    if (!this._interactivePage || this._interactivePage.isClosed()) {
+      this._interactivePage = await this._interactiveCtx.newPage();
+    }
+    try { await this._interactivePage.bringToFront(); } catch (e) {}
+    return this._interactivePage;
+  }
+
+  // youtu.be/<id> -> youtube.com/watch?v=<id>: a cross-domain redirect headful
+  // instance-on elhasal, a youtube.com-on belüli útvonalak viszont mennek.
+  _normalizeUrl(url) {
+    const m = (url || '').match(/^https?:\/\/(?:www\.)?youtu\.be\/([\w-]+)/i);
+    return m ? `https://www.youtube.com/watch?v=${m[1]}` : url;
   }
 
   async clearSessions(site) {
