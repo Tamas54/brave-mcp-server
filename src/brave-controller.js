@@ -22,6 +22,44 @@ const __dirname = path.dirname(__filename);
 const puppeteer = addExtra(rebrowserPuppeteer);
 puppeteer.use(StealthPlugin());
 
+// 2026-07-01: SCRAPE-SÁV FÉK — concurrency-cap + böngésző-recycle. A Brave MCP
+// megosztott instance-át az Echolot háttér-scrape-je folyamatosan terheli; fék
+// nélkül a párhuzamos lapok RAM-spike-ot, a Chromium kúszó RSS-e pedig lassú
+// OOM-ot okoz (megfigyelt ismétlődő crash, ~napi és rosszabb esetben óránkénti).
+// A gate két dolgot ad: (1) max N egyidejű scrape-lap, (2) minden RECYCLE_AFTER
+// scrape után — BIZTONSÁGOS ablakban, amikor egyedüli aktív scrape vagyunk — a
+// böngésző teljes újraindítása, ami nullázza a felhalmozott Chromium-memóriát.
+class ScrapeGate {
+  constructor(controller, { max, recycleAfter }) {
+    this._c = controller;
+    this.max = Math.max(1, max);
+    this.recycleAfter = Math.max(0, recycleAfter);
+    this.active = 0;        // épp futó scrape-ek száma
+    this.since = 0;         // scrape-ek száma a legutóbbi recycle óta
+    this._waiters = [];     // permitre váró feloldók (FIFO)
+  }
+  async acquire() {
+    if (this.active >= this.max) {
+      await new Promise(res => this._waiters.push(res));
+    }
+    this.active++;
+    // Recycle CSAK ha mi vagyunk az EGYETLEN aktív scrape (active===1) és
+    // átléptük a küszöböt -> párhuzamos in-flight scrape-et sose szakítunk meg.
+    // (Sustained max-terhelésnél a recycle a következő lulire csúszik — az
+    // Echolot forgalma bursty, ezért ez a gyakorlatban rendszeresen lefut.)
+    if (this.recycleAfter && this.active === 1 && this.since >= this.recycleAfter) {
+      this.since = 0;
+      try { await this._c._recycleBrowser(); } catch (e) { /* best-effort */ }
+    }
+  }
+  release() {
+    this.since++;
+    this.active = Math.max(0, this.active - 1);
+    const next = this._waiters.shift();
+    if (next) next();
+  }
+}
+
 export class BraveController {
   constructor() {
     this.browser = null;
@@ -35,6 +73,11 @@ export class BraveController {
     // dolgoznak -> sose látják a scrape-sáv lapjait. A scrape-sáv változatlan.
     this._interactiveCtx = null;   // dedikált BrowserContext az interaktív agentnek
     this._interactivePage = null;  // kötött lap-referencia (NEM "utolsó lap")
+    // Scrape-sáv fék (Echolot-terhelés → OOM ellen). Env-hangolható.
+    this._scrapeGate = new ScrapeGate(this, {
+      max: parseInt(process.env.BRAVE_MAX_CONCURRENCY || '2', 10),
+      recycleAfter: parseInt(process.env.BRAVE_RECYCLE_AFTER || '60', 10),
+    });
     this.turndownService = new TurndownService({
       headingStyle: 'atx',
       codeBlockStyle: 'fenced',
@@ -293,7 +336,11 @@ export class BraveController {
       return await this._scrapeViaWebclaw(url, options);
     }
 
-    const page = await this.newPage();
+    // ─── SCRAPE-SÁV FÉK ─────────────────────────────────────────────────
+    // Permit a concurrency-caphoz + esetleges böngésző-recycle biztonságos
+    // ablakban. A newPage() a try-on BELÜL nyílik -> ha dob, a finally akkor is
+    // felszabadítja a permitet (nincs szivárgás). Release + lap-zárás: finally.
+    await this._scrapeGate.acquire();
 
     // ─── STEALTH MODE — opt-in, opciós paraméter ────────────────────────
     // options.stealth === true esetén:
@@ -306,7 +353,9 @@ export class BraveController {
     // MNB, ECB, DBnomics) ez tökéletes, mert ott nincs anti-bot-fal.
     const stealthMode = options.stealth === true;
 
+    let page;
     try {
+      page = await this.newPage();
       if (stealthMode) {
         // Random UA + viewport — Cloudflare TLS-fingerprint statisztikát megtöri.
         const ua = BraveController.UA_POOL[
@@ -444,7 +493,8 @@ export class BraveController {
       return this._decorateContentFlags(result);
 
     } finally {
-      await page.close();
+      if (page) { try { await page.close(); } catch (e) { /* recycle közben már zárt */ } }
+      this._scrapeGate.release();
     }
   }
 
@@ -1553,6 +1603,19 @@ export class BraveController {
       await this._initPromise;
     }
     return this.browser;
+  }
+
+  // 2026-07-01: teljes böngésző-újraindítás a kúszó Chromium-RSS nullázására.
+  // Nullázza a handle-öket (browser + interaktív context/lap), lezárja a régi
+  // böngészőt; a következő ensureBrowser() frisset indít. CSAK biztonságos
+  // ablakban hívjuk (ScrapeGate: egyedüli aktív scrape) -> nem szakít meg mást.
+  async _recycleBrowser() {
+    const b = this.browser;
+    if (!b) return;
+    this.browser = null;
+    this._interactiveCtx = null;
+    this._interactivePage = null;
+    try { await b.close(); } catch (e) { /* már halott — záráskor irreleváns */ }
   }
 
   // Minden új lap ezen át nyílik -> garantáltan él a böngésző.

@@ -148,12 +148,24 @@ app.get('/health/deep', async (req, res) => {
       braveController = new BraveController();
       await braveController.initialize();
     }
-    const tool = tools.find(t => t.name === 'brave_search');
-    if (!tool) throw new Error('brave_search tool not registered');
+    // 2026-07-01: HÁLÓZAT-FÜGGETLEN mély-próba. A régi próba egy ÉLŐ brave_search-öt
+    // futtatott (valódi külső scrape) -> ha a net/Cloudflare akadozott, a healthcheck
+    // elbukott, Railway feleslegesen újraindított, és a restartPolicyMaxRetries
+    // kimerülésével HALVA hagyta a konténert (a crash-loop egyik gyanúsítottja).
+    // Az új próba csak azt méri, amit a liveness-nek mérnie kell: ÉL-e a Chromium
+    // és VÁLASZOL-e (nem hung) — egy üres lap nyit/evaluate/zár, külső hálózat nélkül.
     await withTimeout(
-      tool.execute(braveController, { query: 'hello', limit: 1 }),
+      (async () => {
+        await braveController.ensureBrowser();
+        const page = await braveController.newPage();
+        try {
+          await page.evaluate(() => 1);
+        } finally {
+          try { await page.close(); } catch (e) { /* irreleváns */ }
+        }
+      })(),
       HEALTH_DEEP_TIMEOUT_MS,
-      'deep-health brave_search'
+      'deep-health browser-probe'
     );
     _deepCache = { ts: now, ok: true, reason: '' };
     res.json({
