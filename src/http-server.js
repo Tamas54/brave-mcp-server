@@ -113,15 +113,33 @@ app.get('/.well-known/openid_configuration', (req, res) => {
   });
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({
+// Health check endpoint — 2026-07-05: bővítve öngyógyítás-telemetriával
+// (browser alive, RSS, utolsó sikeres scrape, breaker-állapot, árva-kill
+// számláló). SZÁNDÉKOSAN mindig 200: ez liveness-jelzés + megfigyelhetőség;
+// a Railway-restartot a /health/deep vezérli (különben a lazy-init "browser
+// még nincs" állapota induláskor restart-hurkot okozna).
+app.get('/health', async (req, res) => {
+  const body = {
     status: 'ok',
     server: 'brave-mcp-server',
     version: '2.0.0',
     timestamp: new Date().toISOString(),
-    auth: 'optional'
-  });
+    auth: 'optional',
+    uptime_s: Math.round(process.uptime()),
+    node_rss_mb: Math.round(process.memoryUsage().rss / 1048576),
+  };
+  if (braveController) {
+    try {
+      Object.assign(body, braveController.getHealthStats());
+      Object.assign(body, await braveController.getChromiumStats());
+    } catch (e) {
+      body.stats_error = e.message;
+    }
+  } else {
+    body.browser_alive = false;
+    body.note = 'browser lazy-init: még nem volt tool-hívás';
+  }
+  res.json(body);
 });
 
 // Deep health check — probes brave_search end-to-end and reports 503 if

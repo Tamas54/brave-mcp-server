@@ -7,6 +7,10 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileP = promisify(execFile);
 
 const require = createRequire(import.meta.url);
 
@@ -30,13 +34,21 @@ puppeteer.use(StealthPlugin());
 // scrape után — BIZTONSÁGOS ablakban, amikor egyedüli aktív scrape vagyunk — a
 // böngésző teljes újraindítása, ami nullázza a felhalmozott Chromium-memóriát.
 class ScrapeGate {
-  constructor(controller, { max, recycleAfter }) {
+  constructor(controller, { max, recycleAfter, maxAgeMs }) {
     this._c = controller;
     this.max = Math.max(1, max);
     this.recycleAfter = Math.max(0, recycleAfter);
+    // 2026-07-05: KOR-ALAPÚ recycle is — a scrape-számláló mellett a böngésző
+    // életkora is küszöb (default 30 perc). Ritka-de-hosszú lapokkal (crawl,
+    // FlareSolverr-render) a kúszó RSS scrape-count nélkül is felgyűlhet.
+    this.maxAgeMs = Math.max(0, maxAgeMs || 0);
     this.active = 0;        // épp futó scrape-ek száma
     this.since = 0;         // scrape-ek száma a legutóbbi recycle óta
     this._waiters = [];     // permitre váró feloldók (FIFO)
+  }
+  _browserAged() {
+    return !!(this.maxAgeMs && this._c.browser && this._c._browserLaunchTs &&
+      (Date.now() - this._c._browserLaunchTs) > this.maxAgeMs);
   }
   async acquire() {
     if (this.active >= this.max) {
@@ -44,10 +56,12 @@ class ScrapeGate {
     }
     this.active++;
     // Recycle CSAK ha mi vagyunk az EGYETLEN aktív scrape (active===1) és
-    // átléptük a küszöböt -> párhuzamos in-flight scrape-et sose szakítunk meg.
-    // (Sustained max-terhelésnél a recycle a következő lulire csúszik — az
-    // Echolot forgalma bursty, ezért ez a gyakorlatban rendszeresen lefut.)
-    if (this.recycleAfter && this.active === 1 && this.since >= this.recycleAfter) {
+    // átléptük a scrape-count VAGY az életkor-küszöböt -> párhuzamos in-flight
+    // scrape-et sose szakítunk meg. (Sustained max-terhelésnél a recycle a
+    // következő lulire csúszik — az Echolot forgalma bursty, ezért ez a
+    // gyakorlatban rendszeresen lefut. Idle-korosodást a watchdog fed le.)
+    if (this.active === 1 &&
+        ((this.recycleAfter && this.since >= this.recycleAfter) || this._browserAged())) {
       this.since = 0;
       try { await this._c._recycleBrowser(); } catch (e) { /* best-effort */ }
     }
@@ -57,6 +71,55 @@ class ScrapeGate {
     this.active = Math.max(0, this.active - 1);
     const next = this._waiters.shift();
     if (next) next();
+  }
+}
+
+// 2026-07-05: CIRCUIT BREAKER a scrape-sávra. Ha a böngésző-motor sorozatban
+// hibázik (5 egymást követő browser-osztályú hiba), a breaker NYIT: minden
+// hívó AZONNAL értelmes hibát kap ({error:"brave_down", retry_after:N})
+// timeout-lógás helyett. 60 mp után half-open: EGYETLEN próbahívást enged át;
+// siker → zár, hiba → újranyit. Csak browser-halál-osztályú hibákat számol
+// (Protocol error / Target closed / navigation-hang) — egy-egy rossz URL
+// (DNS-hiba, 404) NEM nyitja a breakert.
+class CircuitBreaker {
+  constructor({ threshold = 5, cooldownMs = 60000 } = {}) {
+    this.threshold = Math.max(1, threshold);
+    this.cooldownMs = Math.max(1000, cooldownMs);
+    this.consecutiveFailures = 0;
+    this.state = 'closed';        // closed | open | half_open
+    this.openedAt = 0;
+    this._probeInFlight = false;  // half-open: egyszerre csak 1 próbahívás
+  }
+  canPass() {
+    if (this.state === 'closed') return true;
+    if (this.state === 'open' && Date.now() - this.openedAt >= this.cooldownMs) {
+      this.state = 'half_open';
+    }
+    if (this.state === 'half_open' && !this._probeInFlight) {
+      this._probeInFlight = true;
+      return true;
+    }
+    return false;
+  }
+  retryAfterSec() {
+    const remaining = this.cooldownMs - (Date.now() - this.openedAt);
+    return Math.max(1, Math.ceil(remaining / 1000));
+  }
+  recordSuccess() {
+    this.consecutiveFailures = 0;
+    this.state = 'closed';
+    this._probeInFlight = false;
+  }
+  recordFailure() {
+    this.consecutiveFailures++;
+    this._probeInFlight = false;
+    if (this.state === 'half_open' || this.consecutiveFailures >= this.threshold) {
+      if (this.state !== 'open') {
+        console.warn(`[breaker] NYIT — ${this.consecutiveFailures} egymást követő browser-hiba, ${Math.round(this.cooldownMs / 1000)}s cooldown`);
+      }
+      this.state = 'open';
+      this.openedAt = Date.now();
+    }
   }
 }
 
@@ -74,10 +137,30 @@ export class BraveController {
     this._interactiveCtx = null;   // dedikált BrowserContext az interaktív agentnek
     this._interactivePage = null;  // kötött lap-referencia (NEM "utolsó lap")
     // Scrape-sáv fék (Echolot-terhelés → OOM ellen). Env-hangolható.
+    // 2026-07-05: recycleAfter 60→50 (stabilizálási spec: max 50 scrape) +
+    // kor-alapú küszöb (max 30 perc böngésző-élettartam).
     this._scrapeGate = new ScrapeGate(this, {
       max: parseInt(process.env.BRAVE_MAX_CONCURRENCY || '2', 10),
-      recycleAfter: parseInt(process.env.BRAVE_RECYCLE_AFTER || '60', 10),
+      recycleAfter: parseInt(process.env.BRAVE_RECYCLE_AFTER || '50', 10),
+      maxAgeMs: parseInt(process.env.BRAVE_RECYCLE_MAX_AGE_MIN || '30', 10) * 60 * 1000,
     });
+    // 2026-07-05: circuit breaker a scrape-sávra (5 hiba → 60s open → half-open).
+    this._breaker = new CircuitBreaker({
+      threshold: parseInt(process.env.BRAVE_BREAKER_THRESHOLD || '5', 10),
+      cooldownMs: parseInt(process.env.BRAVE_BREAKER_COOLDOWN_MS || '60000', 10),
+    });
+    // Telemetria a /health-hez.
+    this._browserLaunchTs = null;    // utolsó sikeres launch időpontja
+    this._lastScrapeOkTs = null;     // utolsó SIKERES scrape időpontja
+    this._scrapeOkCount = 0;
+    this._scrapeFailCount = 0;
+    this._launchFailures = 0;        // EGYMÁS UTÁNI launch-hibák (3 → exit(1))
+    this._orphansKilled = 0;
+    // 2026-07-05: watchdog — 60 mp-enként árva-chromium reap + idle kor-recycle.
+    this._watchdog = null;
+    if (process.env.BRAVE_WATCHDOG_DISABLED !== 'true') {
+      this._startWatchdog();
+    }
     this.turndownService = new TurndownService({
       headingStyle: 'atx',
       codeBlockStyle: 'fenced',
@@ -90,8 +173,43 @@ export class BraveController {
 
   async initialize() {
     const bravePath = process.env.BRAVE_PATH || this.detectBravePath();
-    
-    const launched = await puppeteer.launch({
+
+    let launched;
+    try {
+      launched = await this._launchBrowser(bravePath);
+    } catch (e) {
+      // 2026-07-05: 3 EGYMÁS UTÁNI launch-halál → a konténer menthetetlen
+      // (törött profil / kifogyott erőforrás) → process.exit(1), a Railway
+      // ON_FAILURE restart-policyja tiszta lappal indít újra.
+      this._launchFailures++;
+      console.error(`❌ Browser-launch hiba (${this._launchFailures}/3): ${e.message}`);
+      if (this._launchFailures >= 3) {
+        console.error('💀 3 egymás utáni browser-launch-halál — process.exit(1), a Railway tiszta lappal újraindít');
+        process.exit(1);
+      }
+      throw e;
+    }
+    this._launchFailures = 0;
+    this._browserLaunchTs = Date.now();
+    this.browser = launched;
+
+    // 2026-06-29: ha a Chromium meghal, a this.browser stale handle marad -> a
+    // disconnected-handler nullázza, így a következő ensureBrowser() újraépíti
+    // (zombi-szerver ellen). A `=== launched` guard: egy ÁRVA/régi böngésző
+    // disconnect-je NE nullázza a frissen indítottat (verseny-védelem).
+    launched.on('disconnected', () => {
+      if (this.browser === launched) {
+        this.browser = null;
+        // A böngésző halálával a context+lap handle-ök is stale-ek -> nullázd,
+        // hogy a getInteractivePage() friss böngészőn újraépítse őket.
+        this._interactiveCtx = null;
+        this._interactivePage = null;
+      }
+    });
+  }
+
+  _launchBrowser(bravePath) {
+    return puppeteer.launch({
       executablePath: bravePath,
       headless: process.env.HEADLESS === 'true' ? 'new' : false,
       // Erősített launch — Cloudflare TLS-fingerprint + viselkedés-detektor
@@ -113,21 +231,6 @@ export class BraveController {
         '--start-maximized',
         '--enable-features=NetworkService,NetworkServiceInProcess',
       ]
-    });
-    this.browser = launched;
-
-    // 2026-06-29: ha a Chromium meghal, a this.browser stale handle marad -> a
-    // disconnected-handler nullázza, így a következő ensureBrowser() újraépíti
-    // (zombi-szerver ellen). A `=== launched` guard: egy ÁRVA/régi böngésző
-    // disconnect-je NE nullázza a frissen indítottat (verseny-védelem).
-    launched.on('disconnected', () => {
-      if (this.browser === launched) {
-        this.browser = null;
-        // A böngésző halálával a context+lap handle-ök is stale-ek -> nullázd,
-        // hogy a getInteractivePage() friss böngészőn újraépítse őket.
-        this._interactiveCtx = null;
-        this._interactivePage = null;
-      }
     });
   }
 
@@ -336,12 +439,85 @@ export class BraveController {
       return await this._scrapeViaWebclaw(url, options);
     }
 
+    // ─── CIRCUIT BREAKER — 2026-07-05 ───────────────────────────────────
+    // Ha a browser-motor sorozatban halott, NE várassuk a hívót timeout-ig:
+    // azonnali, strukturált hiba retry_after-rel. A webclaw/flaresolverr
+    // opt-in path-ok (fent) NEM browseresek, azokat a breaker nem érinti;
+    // az auto_fallback chain L1/L2-je itt gyorsan hibázik és eszkalál tovább.
+    if (!this._breaker.canPass()) {
+      return {
+        url,
+        title: '',
+        markdown: '',
+        text: '',
+        error: 'brave_down',
+        retry_after: this._breaker.retryAfterSec(),
+        cf_status: 'circuit_open',
+        content_usable: false,
+        block_reason: 'brave_down',
+      };
+    }
+
     // ─── SCRAPE-SÁV FÉK ─────────────────────────────────────────────────
     // Permit a concurrency-caphoz + esetleges böngésző-recycle biztonságos
-    // ablakban. A newPage() a try-on BELÜL nyílik -> ha dob, a finally akkor is
-    // felszabadítja a permitet (nincs szivárgás). Release + lap-zárás: finally.
+    // ablakban. A newPage() a _scrapeOnce try-ján BELÜL nyílik -> ha dob, a
+    // finally akkor is zárja a lapot, a külső finally pedig a permitet
+    // (nincs szivárgás).
     await this._scrapeGate.acquire();
+    try {
+      // ─── RETRY — 2026-07-05: 2 újrapróbálkozás exponenciális backoffal ──
+      // (1s, 4s). CSAK browser-halál-osztályú hibákra (Protocol error /
+      // Target closed / disconnected) — ezek gyorsan buknak, és a következő
+      // kísérlet ensureBrowser()-e friss böngészőt indít. Tartalmi/hálózati
+      // hibát (DNS, 404, nav-timeout) NEM retry-zunk, az csak lassítana.
+      const backoffs = [1000, 4000];
+      let lastErr = null;
+      for (let attempt = 0; attempt <= backoffs.length; attempt++) {
+        try {
+          const result = await this._scrapeOnce(url, options);
+          this._breaker.recordSuccess();
+          this._lastScrapeOkTs = Date.now();
+          this._scrapeOkCount++;
+          return result;
+        } catch (e) {
+          lastErr = e;
+          if (attempt < backoffs.length && this._isTransientBrowserError(e)) {
+            console.warn(`[retry] scrape browser-hiba (${attempt + 1}. kísérlet): ${e.message} — ${backoffs[attempt]}ms backoff`);
+            await BraveController._sleep(backoffs[attempt]);
+            continue;
+          }
+          break;
+        }
+      }
+      this._scrapeFailCount++;
+      // Breakerbe csak a browser-halál / hung-browser osztály számít.
+      if (this._isBreakerCountableError(lastErr)) {
+        this._breaker.recordFailure();
+      }
+      throw lastErr;
+    } finally {
+      this._scrapeGate.release();
+    }
+  }
 
+  // Browser-halál-osztályú hiba: gyorsan bukik, retry-ra érdemes (a következő
+  // ensureBrowser() friss Chromiumot indít).
+  _isTransientBrowserError(err) {
+    const m = String(err?.message || err || '');
+    return /Protocol error|Target closed|Session closed|Connection closed|browser has disconnected|Browser is not connected|Navigating frame was detached|Browser closed/i.test(m);
+  }
+
+  // Breaker-countable: browser-halál VAGY navigation-hang (a zombi-böngésző
+  // klasszikus tünete). Sima site-oldali hibák (DNS, ERR_CONNECTION_REFUSED)
+  // NEM nyitják a breakert.
+  _isBreakerCountableError(err) {
+    if (this._isTransientBrowserError(err)) return true;
+    const m = String(err?.message || err || '');
+    return /Navigation timeout|TimeoutError|Timed out/i.test(m) || err?.name === 'TimeoutError';
+  }
+
+  // A tényleges Puppeteer-scrape — feltételezi, hogy a gate-permit már a miénk.
+  async _scrapeOnce(url, options = {}) {
     // ─── STEALTH MODE — opt-in, opciós paraméter ────────────────────────
     // options.stealth === true esetén:
     //   • UA + viewport randomizáció (Chrome 120-122 variants)
@@ -356,6 +532,13 @@ export class BraveController {
     let page;
     try {
       page = await this.newPage();
+      // ─── MEMÓRIA-DIÉTA — 2026-07-05: kép/font/media/tracker blokkolás ──
+      // CSAK a scrape-sávon, CSAK ha nem kell screenshot és nem stealth mód
+      // (a CF-challenge-feloldásnak teljes erőforrás-készlet kellhet).
+      // Az interaktív/vizuális sáv (getInteractivePage) ÉRINTETLEN.
+      if (!stealthMode && !options.screenshot) {
+        await this._applyScrapeDiet(page);
+      }
       if (stealthMode) {
         // Random UA + viewport — Cloudflare TLS-fingerprint statisztikát megtöri.
         const ua = BraveController.UA_POOL[
@@ -493,8 +676,10 @@ export class BraveController {
       return this._decorateContentFlags(result);
 
     } finally {
+      // Lap-zárás MINDEN kimeneten (hiba esetén is). A scrape-lapok a default
+      // BrowserContextben élnek — azt nem lehet/kell zárni, a page.close() a
+      // teljes takarítás; a context-szintű nullázást a recycle végzi.
       if (page) { try { await page.close(); } catch (e) { /* recycle közben már zárt */ } }
-      this._scrapeGate.release();
     }
   }
 
@@ -615,6 +800,8 @@ export class BraveController {
     for (const engine of tries) {
       const page = await this.newPage();
       try {
+        // Memória-diéta a search-lapokra is (nincs screenshot-igény).
+        await this._applyScrapeDiet(page);
         await page.setUserAgent(
           'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
         );
@@ -646,6 +833,7 @@ export class BraveController {
     // Idempotens + halott-handle-biztos: előbb nullázunk (a disconnected-handler
     // és párhuzamos ensureBrowser ne lásson félkész állapotot), a close() hibáját
     // záráskor nyeljük (egy már levált böngésző close()-a dobhat).
+    if (this._watchdog) { clearInterval(this._watchdog); this._watchdog = null; }
     const b = this.browser;
     this.browser = null;
     this._initPromise = null;
@@ -837,6 +1025,7 @@ export class BraveController {
 
   async detectLoginConfig(url) {
     // Intelligent login form detection for custom sites
+    // 2026-07-05: page.close() try/finally-ba (dupla-close / hibaági szivárgás fix)
     const page = await this.newPage();
     try {
       await page.goto(url, { waitUntil: 'networkidle2' });
@@ -891,12 +1080,12 @@ export class BraveController {
         };
       });
       
-      await page.close();
       return config;
-      
+
     } catch (error) {
-      await page.close();
       return null;
+    } finally {
+      try { await page.close(); } catch (e) { /* már zárt */ }
     }
   }
 
@@ -960,15 +1149,18 @@ export class BraveController {
   async executeSessionAction(params) {
     // Load saved session
     const sessionPath = path.join(process.cwd(), '.sessions', `${params.site}_session.json`);
-    
+
+    // 2026-07-05: lap-leak fix — a page korábban CSAK a sikeres ágon záródott,
+    // hiba esetén árván maradt (kúszó RSS). Most try/finally zárja mindig.
+    let page = null;
     try {
       const sessionData = JSON.parse(await fs.readFile(sessionPath, 'utf-8'));
-      
+
       if (Date.now() - sessionData.timestamp > 24 * 60 * 60 * 1000) {
         throw new Error('Session expired, please login again');
       }
 
-      const page = await this.newPage();
+      page = await this.newPage();
       
       // Restore session
       await page.setUserAgent(sessionData.userAgent);
@@ -1036,15 +1228,16 @@ export class BraveController {
         throw new Error(`Action ${params.action} not implemented for ${params.site}`);
       }
 
-      await page.close();
       return { success: true, data: result };
 
     } catch (error) {
-      return { 
-        success: false, 
+      return {
+        success: false,
         error: error.message,
         hint: 'You may need to login again'
       };
+    } finally {
+      if (page) { try { await page.close(); } catch (e) { /* már zárt */ } }
     }
   }
 
@@ -1622,6 +1815,195 @@ export class BraveController {
   async newPage() {
     await this.ensureBrowser();
     return this.browser.newPage();
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  MEMÓRIA-DIÉTA — 2026-07-05 (scrape-sáv request-blokkolás)
+  // ════════════════════════════════════════════════════════════════════
+  // Kép/font/media + analytics-tracker requestek blokkolása a scrape-lapokon.
+  // A markdown/text-kinyeréshez ezek nem kellenek, viszont a Chromium RSS-ét
+  // és a networkidle2-várakozást is jelentősen hizlalják. FIGYELEM: az
+  // interaktív/vizuális sáv (visual_inspect / screenshot / set-of-marks) NEM
+  // kapja meg — ott a képek kellenek.
+  async _applyScrapeDiet(page) {
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      try {
+        if (BraveController.DIET_BLOCKED_TYPES.has(req.resourceType()) ||
+            BraveController.DIET_BLOCKED_HOSTS.some(p => req.url().includes(p))) {
+          return req.abort();
+        }
+        return req.continue();
+      } catch (e) {
+        // már kezelt request / lap záródik — best effort
+        try { req.continue(); } catch (_) {}
+      }
+    });
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  WATCHDOG — 2026-07-05 (árva-Chromium reap + idle kor-recycle)
+  // ════════════════════════════════════════════════════════════════════
+  // 60 mp-enként: (1) az 5 percnél öregebb ÁRVA chromium-processzek SIGKILL —
+  // a saját élő böngésző-fát (node leszármazottai + browser.process() fája)
+  // SOHA nem lőjük; ráadásul csak automatizációs markerű processzeket
+  // (--headless / --remote-debugging / puppeteer-profil) célzunk, így lokál
+  // gépen a Kommandant saját desktop-Brave-je garantáltan védett.
+  // (2) ha a böngésző kora > maxAge és épp NINCS aktív scrape → graceful
+  // recycle (a gate-permit megfogásával, hogy in-flight scrape-et ne törjünk).
+  _startWatchdog() {
+    const intervalMs = parseInt(process.env.BRAVE_WATCHDOG_INTERVAL_MS || '60000', 10);
+    this._watchdog = setInterval(() => {
+      this._watchdogTick().catch(e => console.warn(`[watchdog] tick hiba: ${e.message}`));
+    }, intervalMs);
+    this._watchdog.unref(); // ne tartsa életben a processzt
+  }
+
+  async _watchdogTick() {
+    // 1) árva chromium reap
+    const maxAgeS = parseInt(process.env.BRAVE_ORPHAN_MAX_AGE_S || '300', 10);
+    await this._reapOrphanChromium(maxAgeS);
+    // 2) idle kor-recycle: terhelés alatt a ScrapeGate.acquire() intézi; ha
+    // viszont nincs forgalom, itt fogunk permitet és biztonságos ablakban
+    // (egyedüli permit-birtokosként) újraindítjuk az öreg böngészőt.
+    if (this._scrapeGate._browserAged() && this._scrapeGate.active === 0) {
+      await this._scrapeGate.acquire();
+      try {
+        if (this._scrapeGate.active === 1 && this._scrapeGate._browserAged()) {
+          console.log('[watchdog] böngésző-életkor > küszöb, idle recycle');
+          this._scrapeGate.since = 0;
+          await this._recycleBrowser();
+        }
+      } finally {
+        this._scrapeGate.release();
+      }
+    }
+  }
+
+  static async _listProcesses() {
+    const { stdout } = await execFileP('ps', ['-eo', 'pid=,ppid=,etimes=,rss=,args=']);
+    return stdout.split('\n')
+      .map(l => l.trim())
+      .filter(Boolean)
+      .map(l => {
+        const m = l.match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/);
+        return m ? { pid: +m[1], ppid: +m[2], etimes: +m[3], rssKb: +m[4], args: m[5] } : null;
+      })
+      .filter(Boolean);
+  }
+
+  // Automatizált (puppeteer-indítású) chromium-processz felismerése. A sima
+  // desktop-Brave (snap) NEM matchel — nincs headless/remote-debugging markere.
+  static _isAutomationChromium(p) {
+    if (!/(brave|chrome|chromium)/i.test(p.args)) return false;
+    return /--headless|--remote-debugging-(port|pipe)|puppeteer_dev_chrome_profile|--user-data-dir=\/tmp/i.test(p.args);
+  }
+
+  _ownBrowserPid() {
+    try { return this.browser?.process()?.pid ?? null; } catch (_) { return null; }
+  }
+
+  async _reapOrphanChromium(minAgeS) {
+    let procs;
+    try {
+      procs = await BraveController._listProcesses();
+    } catch (e) {
+      return 0; // nincs ps (pl. minimál konténer) — watchdog e része kimarad
+    }
+    const byPid = new Map(procs.map(p => [p.pid, p]));
+    const children = new Map();
+    for (const p of procs) {
+      if (!children.has(p.ppid)) children.set(p.ppid, []);
+      children.get(p.ppid).push(p.pid);
+    }
+    // VÉDETT halmaz:
+    //  (a) az ÉLŐ böngésző fő-PID-je + teljes leszármazott-fája,
+    //  (b) a saját node-processzünk + FELMENŐI (wrapper shellek — a cmdline-juk
+    //      tartalmazhat automation-marker stringet, mégsem chromiumok; a
+    //      2026-07-05-ös lokál teszt bizonyította, hogy enélkül öngyilkosság
+    //      lehet a vége).
+    const protectedSet = new Set([process.pid]);
+    let cur = byPid.get(process.pid);
+    while (cur && cur.ppid > 0 && !protectedSet.has(cur.ppid)) {
+      protectedSet.add(cur.ppid);
+      cur = byPid.get(cur.ppid);
+    }
+    const ownPid = this._ownBrowserPid();
+    if (ownPid) {
+      const stack = [ownPid];
+      while (stack.length) {
+        const pid = stack.pop();
+        if (protectedSet.has(pid)) continue;
+        protectedSet.add(pid);
+        for (const c of children.get(pid) || []) stack.push(c);
+      }
+    }
+    // ÁRVA-kritérium: a szülő init/systemd (reparentelt), VAGY a szülő MI
+    // vagyunk (konténerben a node a PID 1 → az árvák alánk reparentelődnek;
+    // az élő böngészőt az (a) védi). Egy MÁSIK élő szerver-instance saját
+    // böngészője így SOHA nem célpont — annak a szülője a másik node.
+    const isOrphaned = (p) => {
+      if (p.ppid === 1 || p.ppid === process.pid) return true;
+      const parent = byPid.get(p.ppid);
+      if (!parent) return true; // szülő már halott
+      return /(^|\/)systemd(\s|$)|systemd --user|(^|\/)init(\s|$)/.test(parent.args);
+    };
+    let killed = 0;
+    for (const p of procs) {
+      if (!BraveController._isAutomationChromium(p)) continue;
+      if (protectedSet.has(p.pid)) continue;
+      if (p.etimes < minAgeS) continue;
+      if (!isOrphaned(p)) continue;
+      try {
+        process.kill(p.pid, 'SIGKILL');
+        killed++;
+        console.warn(`[watchdog] árva chromium SIGKILL: pid=${p.pid} age=${p.etimes}s rss=${Math.round(p.rssKb / 1024)}MB`);
+      } catch (_) { /* közben kimúlt */ }
+    }
+    if (killed) this._orphansKilled += killed;
+    return killed;
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  HEALTH-TELEMETRIA — 2026-07-05 (a /health endpoint táplálása)
+  // ════════════════════════════════════════════════════════════════════
+  getHealthStats() {
+    return {
+      browser_alive: !!(this.browser && this.browser.isConnected()),
+      browser_age_s: this._browserLaunchTs
+        ? Math.round((Date.now() - this._browserLaunchTs) / 1000) : null,
+      last_successful_scrape: this._lastScrapeOkTs
+        ? new Date(this._lastScrapeOkTs).toISOString() : null,
+      scrape_ok_count: this._scrapeOkCount,
+      scrape_fail_count: this._scrapeFailCount,
+      scrapes_since_recycle: this._scrapeGate.since,
+      active_scrapes: this._scrapeGate.active,
+      max_concurrent_scrapes: this._scrapeGate.max,
+      breaker: {
+        state: this._breaker.state,
+        consecutive_failures: this._breaker.consecutiveFailures,
+        ...(this._breaker.state === 'open'
+          ? { retry_after: this._breaker.retryAfterSec() } : {}),
+      },
+      launch_failures: this._launchFailures,
+      orphans_killed: this._orphansKilled,
+    };
+  }
+
+  // Chromium-processzek aggregált RSS-e (MB) + darabszám — /health-hez.
+  // Csak az AUTOMATIZÁCIÓS (puppeteer-indítású) chromiumot számolja, hogy
+  // lokál futáskor a desktop-Brave ne torzítsa a metrikát.
+  async getChromiumStats() {
+    try {
+      const procs = await BraveController._listProcesses();
+      const chromium = procs.filter(p => BraveController._isAutomationChromium(p));
+      return {
+        chromium_process_count: chromium.length,
+        chromium_rss_mb: Math.round(chromium.reduce((s, p) => s + p.rssKb, 0) / 1024),
+      };
+    } catch (_) {
+      return { chromium_process_count: null, chromium_rss_mb: null };
+    }
   }
 
   async getCurrentPage() {
@@ -2365,6 +2747,34 @@ export class BraveController {
     }
   }
 }
+
+// Memória-diéta: blokkolt erőforrás-típusok + analytics/tracker hostok a
+// SCRAPE-sávon (a vizuális/interaktív sáv sosem kapja meg). A stylesheet
+// SZÁNDÉKOSAN nincs blokkolva — némely oldal JS-e CSS-load-ra vár.
+BraveController.DIET_BLOCKED_TYPES = new Set(['image', 'font', 'media']);
+BraveController.DIET_BLOCKED_HOSTS = [
+  'google-analytics.com',
+  'googletagmanager.com',
+  'googlesyndication.com',
+  'adservice.google.',
+  'doubleclick.net',
+  'connect.facebook.net',
+  'facebook.com/tr',
+  'hotjar.com',
+  'segment.io',
+  'segment.com',
+  'mixpanel.com',
+  'scorecardresearch.com',
+  'chartbeat.com',
+  'gemius.pl',
+  'amazon-adsystem.com',
+  'criteo.com',
+  'criteo.net',
+  'taboola.com',
+  'outbrain.com',
+  'newrelic.com',
+  'nr-data.net',
+];
 
 // User-Agent pool — Chrome 120-122 desktop variants (Win/Mac/Linux). A scrape()
 // minden hívásnál véletlenszerűt választ → a TLS-fingerprint statisztika nem
