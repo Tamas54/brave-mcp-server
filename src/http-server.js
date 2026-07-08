@@ -34,6 +34,33 @@ const HEALTH_DEEP_CACHE_MS = parseInt(
 );
 let _deepCache = { ts: 0, ok: true, reason: '' };
 
+// === 2026-07-08: zombi-fix — valódi életjel + tervezett újjászületés ===
+// A /health mostantól browser-próbát jelent (503 halott böngészőnél); a friss
+// watchdog-próbát használja, csak elavultság esetén fut inline próba.
+const HEALTH_PROBE_MAX_AGE_MS = parseInt(
+  process.env.HEALTH_PROBE_MAX_AGE_MS || '90000', 10
+);
+// MEGELŐZŐ ÚJJÁSZÜLETÉS: 6 óránként graceful exit(0) forgalommentes
+// pillanatban (in-flight hívások megvárva; +1 óra után mindenképp).
+// Indok: a 07-05-ös stabilizálás után is ~8-14 óránként zombult a szolgáltatás
+// (éjszaka, forgalom nélkül is) → memória/állapot-degradáció; a node-processz
+// RSS-ét csak a teljes újraindulás nullázza. Railway-n a restartPolicy húzza
+// vissza (railway.json: ALWAYS — az ON_FAILURE a tervezett exit(0)-t NEM
+// indítaná újra!).
+const REBIRTH_AFTER_MS = parseInt(
+  process.env.BRAVE_REBIRTH_AFTER_MS || String(6 * 60 * 60 * 1000), 10
+);
+const REBIRTH_HARD_EXTRA_MS = parseInt(
+  process.env.BRAVE_REBIRTH_HARD_EXTRA_MS || String(60 * 60 * 1000), 10
+);
+const _bornAt = Date.now();
+// In-flight tool-hívás számláló — a rebirth csak üresjáratban lő.
+let _inFlight = 0;
+async function trackInFlight(fn) {
+  _inFlight++;
+  try { return await fn(); } finally { _inFlight--; }
+}
+
 function withTimeout(promise, ms, label) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -113,33 +140,47 @@ app.get('/.well-known/openid_configuration', (req, res) => {
   });
 });
 
-// Health check endpoint — 2026-07-05: bővítve öngyógyítás-telemetriával
-// (browser alive, RSS, utolsó sikeres scrape, breaker-állapot, árva-kill
-// számláló). SZÁNDÉKOSAN mindig 200: ez liveness-jelzés + megfigyelhetőség;
-// a Railway-restartot a /health/deep vezérli (különben a lazy-init "browser
-// még nincs" állapota induláskor restart-hurkot okozna).
+// Health check endpoint — 2026-07-08: VALÓDI ÉLETJEL. A puszta HTTP-életjel
+// NEM egészség: a 07-05 utáni éles zombiknál a /health 200-at adott, miközben
+// a böngésző halott/hung volt. Mostantól a /health browser-próbát jelent:
+// a watchdog friss (<90s) próbáját használja, elavultság esetén inline próba
+// fut (5s korlát). Halott/hung böngésző → 503. A próba hálózat-független
+// (about:blank), így külső net-akadozás NEM okoz fals restartot; a lazy-init
+// restart-hurok sem áll fenn, mert a próba szükség esetén maga indít böngészőt
+// — ha az launch-képes, a válasz 200.
 app.get('/health', async (req, res) => {
   const body = {
-    status: 'ok',
     server: 'brave-mcp-server',
     version: '2.0.0',
     timestamp: new Date().toISOString(),
     auth: 'optional',
     uptime_s: Math.round(process.uptime()),
     node_rss_mb: Math.round(process.memoryUsage().rss / 1048576),
+    in_flight_tools: _inFlight,
+    rebirth_in_s: Math.max(0, Math.round((_bornAt + REBIRTH_AFTER_MS - Date.now()) / 1000)),
   };
-  if (braveController) {
-    try {
-      Object.assign(body, braveController.getHealthStats());
-      Object.assign(body, await braveController.getChromiumStats());
-    } catch (e) {
-      body.stats_error = e.message;
+  let alive = false;
+  try {
+    if (!braveController) {
+      braveController = new BraveController();
     }
-  } else {
-    body.browser_alive = false;
-    body.note = 'browser lazy-init: még nem volt tool-hívás';
+    let probe = braveController._lastProbe;
+    // Inline próba kell, ha (a) nincs friss watchdog-próba, VAGY (b) a handle
+    // láthatóan halott, de a cache-elt próba még zöldet mutatna (a disconnect
+    // és a következő watchdog-tick közti ablakban ne hazudjunk 200-at —
+    // az inline próba ráadásul ensureBrowser()-rel azonnal fel is támaszt).
+    const handleAlive = !!(braveController.browser && braveController.browser.isConnected());
+    if (!probe.ts || Date.now() - probe.ts > HEALTH_PROBE_MAX_AGE_MS || (!handleAlive && probe.ok)) {
+      probe = await braveController.probeBrowser();
+    }
+    alive = probe.ok === true;
+    Object.assign(body, braveController.getHealthStats());
+    Object.assign(body, await braveController.getChromiumStats());
+  } catch (e) {
+    body.stats_error = e.message;
   }
-  res.json(body);
+  body.status = alive ? 'ok' : 'dead_browser';
+  res.status(alive ? 200 : 503).json(body);
 });
 
 // Deep health check — probes brave_search end-to-end and reports 503 if
@@ -240,7 +281,7 @@ app.post('/tools/:toolName', async (req, res) => {
 
     // Execute the tool
     console.log(`🔧 Executing tool: ${toolName}`);
-    const result = await tool.execute(braveController, params);
+    const result = await trackInFlight(() => tool.execute(braveController, params));
     
     res.json({
       success: true,
@@ -358,11 +399,11 @@ app.post('/mcp', async (req, res) => {
       const args = params?.arguments ?? {};
       let result;
       try {
-        result = await withTimeout(
+        result = await trackInFlight(() => withTimeout(
           tool.execute(braveController, args),
           TOOL_CALL_TIMEOUT_MS,
           `tools/call ${toolName}`
-        );
+        ));
       } catch (err) {
         if (String(err.message || '').includes('timeout')) {
           console.error(`⏱️ Tool ${toolName} timed out after ${TOOL_CALL_TIMEOUT_MS}ms`);
@@ -498,7 +539,7 @@ wss.on('connection', (ws) => {
 
         // MCP standard: params = { name, arguments }; ugyanaz a fix mint a HTTP ágon.
         const args = message.params?.arguments ?? {};
-        const result = await tool.execute(braveController, args);
+        const result = await trackInFlight(() => tool.execute(braveController, args));
         
         ws.send(JSON.stringify({
           id: message.id,
@@ -550,5 +591,26 @@ const gracefulShutdown = async (sig) => {
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+// ── MEGELŐZŐ ÚJJÁSZÜLETÉS — 2026-07-08 ─────────────────────────────────────
+// REBIRTH_AFTER_MS (default 6h) elteltével az első forgalommentes pillanatban
+// (nincs in-flight tool-hívás és nincs aktív scrape) graceful exit(0) — a
+// Railway restartPolicy (ALWAYS) tiszta konténerrel újraindít. Ha sosem lesz
+// üresjárat, REBIRTH_HARD_EXTRA_MS (default +1h) után akkor is kilépünk (az
+// in-flight hívásokat a 25s-es TOOL_CALL_TIMEOUT úgyis felülről korlátozza).
+// Ez nullázza a node-processz kúszó RSS-ét is, amit a böngésző-recycle nem ér el.
+setInterval(() => {
+  const age = Date.now() - _bornAt;
+  if (age < REBIRTH_AFTER_MS) return;
+  const activeScrapes = braveController ? braveController._scrapeGate.active : 0;
+  const idle = _inFlight === 0 && activeScrapes === 0;
+  if (idle || age > REBIRTH_AFTER_MS + REBIRTH_HARD_EXTRA_MS) {
+    console.log(
+      `♻️ REBIRTH — tervezett újjászületés: uptime=${Math.round(age / 60000)}min, ` +
+      `in_flight=${_inFlight}, active_scrapes=${activeScrapes}${idle ? '' : ' (hard-deadline)'} — graceful exit(0)`
+    );
+    gracefulShutdown('REBIRTH');
+  }
+}, 30000).unref();
 
 export { app, server };

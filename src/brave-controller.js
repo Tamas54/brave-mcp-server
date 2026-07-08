@@ -139,10 +139,13 @@ export class BraveController {
     // Scrape-sáv fék (Echolot-terhelés → OOM ellen). Env-hangolható.
     // 2026-07-05: recycleAfter 60→50 (stabilizálási spec: max 50 scrape) +
     // kor-alapú küszöb (max 30 perc böngésző-élettartam).
+    // 2026-07-08: recycle-küszöbök szigorítva (zombi-fix spec): 50→25 scrape,
+    // 30→20 perc. A 07-05 utáni éles zombik (8-14 óránként) memória-degradációra
+    // utalnak — a megelőző újjászületés a fő védvonal, nem a reaktív gyógyítás.
     this._scrapeGate = new ScrapeGate(this, {
       max: parseInt(process.env.BRAVE_MAX_CONCURRENCY || '2', 10),
-      recycleAfter: parseInt(process.env.BRAVE_RECYCLE_AFTER || '50', 10),
-      maxAgeMs: parseInt(process.env.BRAVE_RECYCLE_MAX_AGE_MIN || '30', 10) * 60 * 1000,
+      recycleAfter: parseInt(process.env.BRAVE_RECYCLE_AFTER || '25', 10),
+      maxAgeMs: parseInt(process.env.BRAVE_RECYCLE_MAX_AGE_MIN || '20', 10) * 60 * 1000,
     });
     // 2026-07-05: circuit breaker a scrape-sávra (5 hiba → 60s open → half-open).
     this._breaker = new CircuitBreaker({
@@ -156,6 +159,16 @@ export class BraveController {
     this._scrapeFailCount = 0;
     this._launchFailures = 0;        // EGYMÁS UTÁNI launch-hibák (3 → exit(1))
     this._orphansKilled = 0;
+    // 2026-07-08: VALÓDI ÉLETJEL — a watchdog 60 mp-enként browser-próbát
+    // futtat (newPage + evaluate). Ez fogja meg a "connected-de-hung" zombit
+    // is, amit az ensureBrowser() isConnected()-ellenőrzése SOSEM lát meg
+    // (a CDP-socket él, de a böngésző nem válaszol) — ez volt a 07-05 utáni
+    // éles zombik gyógyulatlanságának fő oka.
+    this._lastProbe = { ts: 0, ok: null, ms: null, reason: 'még nem futott próba' };
+    this._probeFailStreak = 0;       // egymást követő próba-bukások (2 → relaunch)
+    this._relaunchFailStreak = 0;    // egymást követő relaunch-bukások (2 → exit(1))
+    this._forcedRelaunches = 0;      // telemetria
+    this._tickBusy = false;          // watchdog-tick átfedés-védelem
     // 2026-07-05: watchdog — 60 mp-enként árva-chromium reap + idle kor-recycle.
     this._watchdog = null;
     if (process.env.BRAVE_WATCHDOG_DISABLED !== 'true') {
@@ -837,9 +850,8 @@ export class BraveController {
     const b = this.browser;
     this.browser = null;
     this._initPromise = null;
-    if (b) {
-      try { await b.close(); } catch (e) { /* már halott/levált — záráskor irreleváns */ }
-    }
+    // 2026-07-08: korlátos zárás — a shutdown sose lógjon egy beragadt close()-on.
+    await this._disposeBrowser(b, 5000);
   }
 
   async login(params) {
@@ -1798,17 +1810,88 @@ export class BraveController {
     return this.browser;
   }
 
+  // 2026-07-08: időkorlátos Promise-verseny (a http-server withTimeout-jának
+  // controller-oldali párja) — a browser.close()/newPage() beragadása ellen.
+  static _withTimeout(promise, ms, label) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  }
+
+  // 2026-07-08: KORLÁTOS böngésző-eldobás. A korábbi kód `await b.close()`-t
+  // hívt KORLÁT NÉLKÜL (_recycleBrowser + close) — beragadt Chromiumnál a
+  // close() ÖRÖKRE lóghat, és mivel a recycle a ScrapeGate.acquire()-en BELÜL
+  // fut, a permit-könyvelés végleg beékelődött (minden későbbi scrape örökre
+  // sorban áll = éjszakai, forgalom nélküli zombi-halál útvonala). Most:
+  // graceMs-ig próbáljuk szépen, utána SIGKILL a fő processznek; a maradék
+  // gyerekeket az árva-reaper szedi össze a következő tickben.
+  async _disposeBrowser(b, graceMs = 3000) {
+    if (!b) return;
+    let proc = null;
+    try { proc = b.process(); } catch (_) {}
+    try {
+      await BraveController._withTimeout(b.close(), graceMs, 'browser.close');
+    } catch (e) {
+      console.warn(`[dispose] browser.close() nem ment le tisztán (${e.message}) — SIGKILL`);
+      try { if (proc && proc.pid) proc.kill('SIGKILL'); } catch (_) { /* már halott */ }
+    }
+  }
+
+  // 2026-07-08: VALÓDI ÉLETJEL-PRÓBA — newPage + about:blank + evaluate, kemény
+  // időkorláttal. Ez az egyetlen megbízható mérce arra, hogy a böngésző TÉNYLEG
+  // válaszol-e (a puszta isConnected() a hung-browsernél hamis pozitív).
+  // A watchdog 60 mp-enként hívja; a /health ennek friss eredményét jelenti.
+  async probeBrowser(timeoutMs = parseInt(process.env.BRAVE_PROBE_TIMEOUT_MS || '5000', 10)) {
+    const t0 = Date.now();
+    try {
+      await BraveController._withTimeout((async () => {
+        await this.ensureBrowser();
+        const page = await this.browser.newPage();
+        try {
+          await page.goto('about:blank', { timeout: timeoutMs });
+          await page.evaluate(() => document.title);
+        } finally {
+          try { await page.close(); } catch (_) { /* irreleváns */ }
+        }
+      })(), timeoutMs, 'browser-probe');
+      this._lastProbe = { ts: Date.now(), ok: true, ms: Date.now() - t0, reason: '' };
+    } catch (e) {
+      this._lastProbe = { ts: Date.now(), ok: false, ms: Date.now() - t0, reason: e.message };
+    }
+    return this._lastProbe;
+  }
+
+  // 2026-07-08: KÉNYSZER-ÚJRAINDÍTÁS a watchdog-eskaláció számára. A stale/hung
+  // handle-öket ELŐBB nulláza (beleértve az esetleg beragadt _initPromise-t is),
+  // korlátos disposal, majd friss launch az ensureBrowser()-rel (aminek az
+  // initialize()-a 3 egymás utáni launch-halálnál maga exit(1)-el).
+  async _forceRelaunchBrowser(reason) {
+    console.warn(`[watchdog] KÉNYSZER-RELAUNCH: ${reason}`);
+    this._forcedRelaunches++;
+    const b = this.browser;
+    this.browser = null;
+    this._interactiveCtx = null;
+    this._interactivePage = null;
+    this._initPromise = null;
+    await this._disposeBrowser(b, 2000);
+    await this.ensureBrowser();
+  }
+
   // 2026-07-01: teljes böngésző-újraindítás a kúszó Chromium-RSS nullázására.
   // Nullázza a handle-öket (browser + interaktív context/lap), lezárja a régi
   // böngészőt; a következő ensureBrowser() frisset indít. CSAK biztonságos
   // ablakban hívjuk (ScrapeGate: egyedüli aktív scrape) -> nem szakít meg mást.
+  // 2026-07-08: a záró await KORLÁTOS (_disposeBrowser) — beragadt close()
+  // többé nem ékeli be a ScrapeGate-et.
   async _recycleBrowser() {
     const b = this.browser;
     if (!b) return;
     this.browser = null;
     this._interactiveCtx = null;
     this._interactivePage = null;
-    try { await b.close(); } catch (e) { /* már halott — záráskor irreleváns */ }
+    await this._disposeBrowser(b);
   }
 
   // Minden új lap ezen át nyílik -> garantáltan él a böngésző.
@@ -1854,12 +1937,50 @@ export class BraveController {
   _startWatchdog() {
     const intervalMs = parseInt(process.env.BRAVE_WATCHDOG_INTERVAL_MS || '60000', 10);
     this._watchdog = setInterval(() => {
-      this._watchdogTick().catch(e => console.warn(`[watchdog] tick hiba: ${e.message}`));
+      // Átfedés-védelem: egy lassú tick (pl. relaunch) alatt ne induljon újabb.
+      if (this._tickBusy) return;
+      this._tickBusy = true;
+      this._watchdogTick()
+        .catch(e => console.warn(`[watchdog] tick hiba: ${e.message}`))
+        .finally(() => { this._tickBusy = false; });
     }, intervalMs);
     this._watchdog.unref(); // ne tartsa életben a processzt
   }
 
   async _watchdogTick() {
+    // 0) VALÓDI ÉLETJEL — 2026-07-08. Browser-próba minden tickben; 2 egymást
+    // követő bukás → teljes kényszer-relaunch; 2 sikertelen relaunch →
+    // process.exit(1) (a Railway tiszta konténerrel újraindít). Ez a réteg
+    // hiányzott: az ensureBrowser() csak a LEVÁLT (isConnected()===false)
+    // böngészőt gyógyította, a connected-de-hung zombit soha.
+    const probe = await this.probeBrowser();
+    if (probe.ok) {
+      if (this._probeFailStreak) console.log('[watchdog] browser-próba újra zöld');
+      this._probeFailStreak = 0;
+      this._relaunchFailStreak = 0;
+    } else {
+      this._probeFailStreak++;
+      console.warn(`[watchdog] browser-próba BUKOTT (${this._probeFailStreak}/2): ${probe.reason}`);
+      if (this._probeFailStreak >= 2) {
+        try {
+          await this._forceRelaunchBrowser(`2 egymást követő próba-bukás: ${probe.reason}`);
+          const verify = await this.probeBrowser();
+          if (!verify.ok) throw new Error(`relaunch utáni próba is bukott: ${verify.reason}`);
+          console.log('[watchdog] browser FELTÁMASZTVA, próba zöld');
+          this._probeFailStreak = 0;
+          this._relaunchFailStreak = 0;
+          // A breaker ne tartsa vissza a forgalmat egy igazoltan friss motortól.
+          this._breaker.recordSuccess();
+        } catch (e) {
+          this._relaunchFailStreak++;
+          console.error(`[watchdog] relaunch SIKERTELEN (${this._relaunchFailStreak}/2): ${e.message}`);
+          if (this._relaunchFailStreak >= 2) {
+            console.error('💀 [watchdog] 2 egymás utáni sikertelen relaunch — process.exit(1), a Railway tiszta lappal újraindít');
+            process.exit(1);
+          }
+        }
+      }
+    }
     // 1) árva chromium reap
     const maxAgeS = parseInt(process.env.BRAVE_ORPHAN_MAX_AGE_S || '300', 10);
     await this._reapOrphanChromium(maxAgeS);
@@ -1987,6 +2108,16 @@ export class BraveController {
       },
       launch_failures: this._launchFailures,
       orphans_killed: this._orphansKilled,
+      // 2026-07-08: valódi életjel-telemetria
+      last_probe: {
+        ok: this._lastProbe.ok,
+        age_s: this._lastProbe.ts
+          ? Math.round((Date.now() - this._lastProbe.ts) / 1000) : null,
+        ms: this._lastProbe.ms,
+        ...(this._lastProbe.reason ? { reason: this._lastProbe.reason } : {}),
+      },
+      probe_fail_streak: this._probeFailStreak,
+      forced_relaunches: this._forcedRelaunches,
     };
   }
 
