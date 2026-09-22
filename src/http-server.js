@@ -6,6 +6,8 @@ import { BraveController } from './brave-controller.js';
 import { tools } from './tools.js';
 import dotenv from 'dotenv';
 import { createRequire } from 'module';
+import crypto from 'crypto';
+import { hostOnly, redactUrls } from './egress.js';
 
 const require = createRequire(import.meta.url);
 
@@ -61,6 +63,45 @@ async function trackInFlight(fn) {
   try { return await fn(); } finally { _inFlight--; }
 }
 
+// ── NAPLÓ-REDAKCIÓ — 2026-09-22 ─────────────────────────────────────────
+// Korábban a /mcp a TELJES kérés-törzset és MINDEN fejlécet naplózta (benne
+// Authorization/Cookie, beírt szöveg, jelszó a brave_login-ban, scriptek,
+// query-stringes URL-ek). Mostantól egy sor kérésenként: metódus, tool-név,
+// az URL HOSTJA, kérés-azonosító, státusz, időtartam. Semmi más.
+const _safeTok = (v, n = 60) => String(v ?? '').replace(/[^\w./:-]/g, '').slice(0, n) || '-';
+function _argsHost(args) {
+  if (!args || typeof args !== 'object') return '-';
+  for (const k of ['url', 'startUrl', 'customUrl']) {
+    if (typeof args[k] === 'string' && args[k]) return hostOnly(args[k]);
+  }
+  return '-';
+}
+function mcpAccessLog(req, res, kind) {
+  const t0 = Date.now();
+  const rid = crypto.randomBytes(4).toString('hex');
+  res.on('finish', () => {
+    const b = (req.body && typeof req.body === 'object') ? req.body : {};
+    let method = '-', tool = '-', host = '-';
+    if (kind === 'mcp') {
+      method = _safeTok(b.method);
+      if (b.method === 'tools/call') {
+        tool = _safeTok(b.params?.name);
+        host = _argsHost(b.params?.arguments);
+      }
+    } else {
+      method = 'tools/call';
+      tool = _safeTok(req.params?.toolName);
+      host = _argsHost(b);
+    }
+    const client = _safeTok(req.get('x-client-id'), 40);
+    console.log(
+      `[${kind}] rid=${rid} id=${_safeTok(b.id, 40)} method=${method} tool=${tool} ` +
+      `host=${host} client=${client} status=${res.statusCode} ms=${Date.now() - t0}`
+    );
+  });
+  return rid;
+}
+
 function withTimeout(promise, ms, label) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -90,7 +131,8 @@ const simpleAuth = (req, res, next) => {
 
 // OAuth token endpoints - both /token and /oauth/token
 const tokenHandler = (req, res) => {
-  console.log('🔐 OAuth token request:', req.body);
+  // 2026-09-22: a törzs (code, client_secret, refresh_token) NEM kerül naplóba.
+  console.log(`🔐 OAuth token request: grant_type=${_safeTok(req.body?.grant_type, 40)}`);
   
   // Accept any token request
   res.json({
@@ -106,14 +148,14 @@ app.post('/oauth/token', tokenHandler);
 
 // Both /authorize and /oauth/authorize for compatibility
 const authorizeHandler = (req, res) => {
-  console.log('🔐 OAuth authorize request:', req.query);
+  console.log(`🔐 OAuth authorize request: client_id=${_safeTok(req.query?.client_id, 60)} redirect_host=${hostOnly(req.query?.redirect_uri)}`);
   
   const { client_id, redirect_uri, response_type, state } = req.query;
   
   if (response_type === 'code') {
     const code = 'brave-auth-code-' + Math.random().toString(36).substr(2, 9);
     const redirectUrl = `${redirect_uri}?code=${code}${state ? `&state=${state}` : ''}`;
-    console.log('🔐 Redirecting to:', redirectUrl);
+    console.log(`🔐 Redirecting to host=${hostOnly(redirect_uri)}`);
     return res.redirect(redirectUrl);
   }
   
@@ -258,6 +300,7 @@ app.get('/tools', (req, res) => {
 
 // Tool execution endpoint
 app.post('/tools/:toolName', async (req, res) => {
+  mcpAccessLog(req, res, 'tools');
   try {
     const toolName = req.params.toolName;
     const params = req.body;
@@ -291,7 +334,7 @@ app.post('/tools/:toolName', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Tool execution error:', error.message);
+    console.error('❌ Tool execution error:', redactUrls(error.message));
     res.status(500).json({
       success: false,
       error: error.message,
@@ -313,9 +356,8 @@ app.get('/mcp', (req, res) => {
 });
 
 app.post('/mcp', async (req, res) => {
+  mcpAccessLog(req, res, 'mcp');
   try {
-    console.log('🔧 MCP Request:', JSON.stringify(req.body, null, 2));
-    console.log('🔧 MCP Headers:', req.headers);
     
     const { method, params, id } = req.body;
     
@@ -445,7 +487,7 @@ app.post('/mcp', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ MCP Error:', error);
+    console.error('❌ MCP Error:', redactUrls(error?.message || String(error)));
     res.status(500).json({
       jsonrpc: '2.0',
       id: req.body?.id ?? null,
@@ -503,7 +545,7 @@ wss.on('connection', (ws) => {
   ws.on('message', async (data) => {
     try {
       const message = JSON.parse(data.toString());
-      console.log('📨 WebSocket message:', message.method);
+      console.log('📨 WebSocket message:', _safeTok(message.method));
       
       if (message.method === 'tools/list') {
         const toolList = tools.map(tool => ({
@@ -592,6 +634,28 @@ const gracefulShutdown = async (sig) => {
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
+// 2026-09-22: a puppeteer-extra stealth plugin (user-agent-override evasion) a
+// lap létrejöttekor AWAIT NÉLKÜL küld CDP-hívást (Network.setUserAgentOverride).
+// Ha a lap/kontextus közben zárul (brave_page felugró ablak, gyors one-shot
+// hívás, recycle), a rejection kezeletlen marad → Node 18 alapból LEÁLLÍTJA a
+// processzt (mérve a teszt-harnessben: "TargetCloseError … Target closed").
+// CSAK a „a cél már nincs" osztályt nyeljük (ritkítva naplózva); minden más
+// kezeletlen rejection a régi módon öl (exit 1 → Railway restart).
+let _lastTargetGoneLog = 0;
+process.on('unhandledRejection', (reason) => {
+  const msg = String(reason?.message || reason || '');
+  if (reason?.name === 'TargetCloseError' ||
+      /Target closed|Session closed|Connection closed|No target with given id|Execution context was destroyed/i.test(msg)) {
+    if (Date.now() - _lastTargetGoneLog > 60000) {
+      _lastTargetGoneLog = Date.now();
+      console.warn(`[unhandledRejection] target-gone, nyelve: ${redactUrls(msg).slice(0, 160)}`);
+    }
+    return;
+  }
+  console.error('💀 unhandledRejection:', redactUrls(reason?.stack || msg));
+  process.exit(1);
+});
+
 // ── MEGELŐZŐ ÚJJÁSZÜLETÉS — 2026-07-08 ─────────────────────────────────────
 // REBIRTH_AFTER_MS (default 6h) elteltével az első forgalommentes pillanatban
 // (nincs in-flight tool-hívás és nincs aktív scrape) graceful exit(0) — a
@@ -603,7 +667,10 @@ setInterval(() => {
   const age = Date.now() - _bornAt;
   if (age < REBIRTH_AFTER_MS) return;
   const activeScrapes = braveController ? braveController._scrapeGate.active : 0;
-  const idle = _inFlight === 0 && activeScrapes === 0;
+  // 2026-09-22: élő brave_page munkamenet (hívások közt is) = nem üresjárat;
+  // a hard-deadline így is érvényes.
+  const pageSessions = braveController?._pageMgr ? braveController._pageMgr.size() : 0;
+  const idle = _inFlight === 0 && activeScrapes === 0 && pageSessions === 0;
   if (idle || age > REBIRTH_AFTER_MS + REBIRTH_HARD_EXTRA_MS) {
     console.log(
       `♻️ REBIRTH — tervezett újjászületés: uptime=${Math.round(age / 60000)}min, ` +

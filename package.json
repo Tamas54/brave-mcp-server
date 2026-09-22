@@ -10,6 +10,7 @@
     "http": "node src/dual-server.js --http-only",
     "stdio": "node src/index.js",
     "test": "node test.js",
+    "test:node": "node --test test/",
     "test-claude": "node claude-test.js",
     "health": "curl -s http://localhost:3002/health | jq .",
     "tools": "curl -s http://localhost:3002/tools | jq '.tools[] | .name'"

@@ -18,3 +18,5 @@ cert.pem
 # Local Webclaw PoC (~1.1GB) — Webclaw is cloned & built inside Stage 1
 # of the Dockerfile from upstream GitHub, not from this local mirror.
 webclaw-poc/
+# node --test csomag (a konténerben nem kell)
+test/

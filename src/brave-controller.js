@@ -9,6 +9,11 @@ import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import {
+  EgressGuard, chromeEgressArgs, egressFilterEnabled, testLoopbackAllowed,
+  BLOCK_HEADER, hostOnly, redactUrls,
+} from './egress.js';
+import { PageSessionManager } from './brave-page.js';
 
 const execFileP = promisify(execFile);
 
@@ -50,9 +55,24 @@ class ScrapeGate {
     return !!(this.maxAgeMs && this._c.browser && this._c._browserLaunchTs &&
       (Date.now() - this._c._browserLaunchTs) > this.maxAgeMs);
   }
-  async acquire() {
+  // 2026-09-22: opcionális timeoutMs (a brave_page a 25 s-os hívás-határidőn
+  // belül akar választ adni, nem örökké sorban állni). Timeout → a várakozó
+  // kikerül a sorból, 'gate_timeout' hibát dob; a régi hívók (paraméter
+  // nélkül) változatlanul várnak.
+  async acquire(timeoutMs = 0) {
     if (this.active >= this.max) {
-      await new Promise(res => this._waiters.push(res));
+      await new Promise((res, rej) => {
+        let timer = null;
+        const waiter = () => { if (timer) clearTimeout(timer); res(); };
+        this._waiters.push(waiter);
+        if (timeoutMs > 0) {
+          timer = setTimeout(() => {
+            const i = this._waiters.indexOf(waiter);
+            if (i >= 0) this._waiters.splice(i, 1);
+            rej(new Error('gate_timeout'));
+          }, timeoutMs);
+        }
+      });
     }
     this.active++;
     // Recycle CSAK ha mi vagyunk az EGYETLEN aktív scrape (active===1) és
@@ -60,8 +80,12 @@ class ScrapeGate {
     // scrape-et sose szakítunk meg. (Sustained max-terhelésnél a recycle a
     // következő lulire csúszik — az Echolot forgalma bursty, ezért ez a
     // gyakorlatban rendszeresen lefut. Idle-korosodást a watchdog fed le.)
+    // 2026-09-22: élő brave_page munkamenet alatt a recycle HALASZTÓDIK (a
+    // recycle a kontextusaikat is megölné) — de legfeljebb maxAge + a
+    // munkamenet abszolút TTL-je erejéig (_pageSessionsHoldRecycle).
     if (this.active === 1 &&
-        ((this.recycleAfter && this.since >= this.recycleAfter) || this._browserAged())) {
+        ((this.recycleAfter && this.since >= this.recycleAfter) || this._browserAged()) &&
+        !this._c._pageSessionsHoldRecycle()) {
       this.since = 0;
       try { await this._c._recycleBrowser(); } catch (e) { /* best-effort */ }
     }
@@ -136,6 +160,14 @@ export class BraveController {
     // dolgoznak -> sose látják a scrape-sáv lapjait. A scrape-sáv változatlan.
     this._interactiveCtx = null;   // dedikált BrowserContext az interaktív agentnek
     this._interactivePage = null;  // kötött lap-referencia (NEM "utolsó lap")
+    // 2026-09-22: EGRESS-SZŰRŐ (lásd egress.js) — a Chrome minden forgalma egy
+    // folyamaton belüli proxyn megy, ami loopbacket/belső hálót/metadata-t tilt.
+    // Kill-switch: BRAVE_EGRESS_FILTER=0.
+    this._egressEnabled = egressFilterEnabled();
+    this._egress = null;
+    this._egressInit = null;
+    // 2026-09-22: brave_page munkamenet-kezelő (lusta példányosítás).
+    this._pageMgr = null;
     // Scrape-sáv fék (Echolot-terhelés → OOM ellen). Env-hangolható.
     // 2026-07-05: recycleAfter 60→50 (stabilizálási spec: max 50 scrape) +
     // kor-alapú küszöb (max 30 perc böngésző-élettartam).
@@ -189,6 +221,10 @@ export class BraveController {
 
     let launched;
     try {
+      // Az egress-proxy a böngésző ELŐTT kell fusson (a portja launch-flag).
+      // Ha nem indul, a launch is bukik — fail-closed: szűrő nélkül NEM
+      // indítunk böngészőt (a kill-switch az egyetlen kerülőút).
+      await this._ensureEgress();
       launched = await this._launchBrowser(bravePath);
     } catch (e) {
       // 2026-07-05: 3 EGYMÁS UTÁNI launch-halál → a konténer menthetetlen
@@ -217,8 +253,98 @@ export class BraveController {
         // hogy a getInteractivePage() friss böngészőn újraépítse őket.
         this._interactiveCtx = null;
         this._interactivePage = null;
+        // A brave_page kontextusok is vele haltak.
+        this._pageMgr?.dropAll('browser_disconnected');
       }
     });
+  }
+
+  // 2026-09-22: az egress-proxy (egyszer, a processz élettartamára; a böngésző
+  // újraindításai ugyanazt a portot kapják).
+  async _ensureEgress() {
+    if (!this._egressEnabled) return null;
+    if (this._egress?.server) return this._egress;
+    this._egressInit ??= (async () => {
+      const g = this._egress || new EgressGuard({ allowTestLoopback: testLoopbackAllowed() });
+      await g.startProxy();
+      this._egress = g;
+      return g;
+    })().finally(() => { this._egressInit = null; });
+    return this._egressInit;
+  }
+
+  // Egress-előszűrés a hívó URL-jére. null = mehet (vagy a szűrő ki van
+  // kapcsolva / az URL nem értelmezhető — azt a régi út kezeli), különben
+  // {blocked, reason} vagy {dns, reason}.
+  async _egressPrecheck(url) {
+    if (!this._egressEnabled) return null;
+    let u;
+    try { u = new URL(String(url)); } catch (_) { return null; }
+    const g = await this._ensureEgress();
+    const v = await g.vetUrl(u.toString());
+    if (v.ok) return null;
+    if (v.kind === 'dns') return { dns: true, reason: v.reason, host: v.host };
+    g.recordBlock(v.host, v.port, v.reason);
+    return { blocked: true, reason: v.reason, host: v.host };
+  }
+
+  // Egységes brave_scrape-válasz egress-tiltásra (a circuit-breaker
+  // 'brave_down' strukturált hibájának mintájára; content_usable=false).
+  _egressBlockedResult(url, reason) {
+    return this._decorateContentFlags({
+      url,
+      title: '',
+      markdown: '',
+      text: '',
+      error: 'egress_blocked',
+      cf_status: 'egress_blocked',
+      blocked: { reason },
+    }, 'egress_blocked');
+  }
+
+  // A scrape-sáv lapjai: goto-séma-őr (file:/chrome:/data: stb. tilos — a
+  // file:///proc/self/environ a szerver env-jét, benne API-kulcsokat adna ki).
+  // A proxy ezeket nem látja (nem hálózati kérések), ezért kell külön őr.
+  _guardPage(page) {
+    if (!this._egressEnabled || !page || page.__egressGuarded) return page;
+    const orig = page.goto.bind(page);
+    page.goto = async (url, opts) => {
+      const str = String(url || '');
+      const i = str.indexOf(':');
+      const sch = i > 0 ? str.slice(0, i).toLowerCase() : '';
+      if (str !== 'about:blank' && sch !== 'http' && sch !== 'https') {
+        throw new Error(`egress_blocked:scheme_not_allowed:${sch || 'none'}`);
+      }
+      return orig(url, opts);
+    };
+    page.__egressGuarded = true;
+    return page;
+  }
+
+  // Élő brave_page munkamenet tartja-e vissza a böngésző-recycle-t. Legfeljebb
+  // maxAge + BRAVE_PAGE_ABS_TTL (default 20 + 30 perc) böngésző-korig — utána a
+  // memória-védelem nyer, a munkamenetek elvesznek (session_lost warninggal).
+  _pageSessionsHoldRecycle() {
+    const n = this._pageMgr ? this._pageMgr.size() : 0;
+    if (!n) return false;
+    const age = this._browserLaunchTs ? Date.now() - this._browserLaunchTs : 0;
+    const cap = (this._scrapeGate.maxAgeMs || 20 * 60 * 1000) + this._pages().limits.absTtlMs;
+    return age < cap;
+  }
+
+  _breakerOpen() {
+    return this._breaker.state === 'open' &&
+      Date.now() - this._breaker.openedAt < this._breaker.cooldownMs;
+  }
+
+  _pages() {
+    this._pageMgr ??= new PageSessionManager(this);
+    return this._pageMgr;
+  }
+
+  // brave_page tool belépési pont (lásd brave-page.js).
+  async pageTool(args) {
+    return this._pages().run(args);
   }
 
   _launchBrowser(bravePath) {
@@ -243,6 +369,8 @@ export class BraveController {
         '--window-size=1920,1080',
         '--start-maximized',
         '--enable-features=NetworkService,NetworkServiceInProcess',
+        // 2026-09-22: egress-szűrő (proxy + loopback-kivétel törlése + WebRTC/QUIC zár).
+        ...(this._egressEnabled && this._egress?.port ? chromeEgressArgs(this._egress.port) : []),
       ]
     });
   }
@@ -254,6 +382,11 @@ export class BraveController {
   // mouse_control mind ugyanazon a látható oldalon dolgozik.
   async navigate(url, options = {}) {
     url = this._normalizeUrl(url);
+    // 2026-09-22: egress-előszűrés — a navigate hibára eddig is dobott, így a
+    // tiltás is dobott hiba (beszédes okkal); DNS-hibánál a Chrome-üzenetet utánozzuk.
+    const pre = await this._egressPrecheck(url);
+    if (pre?.blocked) throw new Error(`egress_blocked:${pre.reason}`);
+    if (pre?.dns) throw new Error(`net::ERR_NAME_NOT_RESOLVED at ${url}`);
     // Az interaktív sáv KÖTÖTT lapja (nem "utolsó lap") -> nincs lap-drift.
     const page = await this.getInteractivePage();
     await page.goto(url, {
@@ -407,6 +540,17 @@ export class BraveController {
     //   6) Wayback Machine cache (~10s) → 7) Google AMP mirror (~10s)
     // A visszaadott payload tartalmazza az `escalation_path` mezőt — telemetria
     // a kliens (Bridge agent) számára.
+    // ─── EGRESS-ELŐSZŰRÉS — 2026-09-22 ───────────────────────────────────
+    // Belső/loopback/metadata cél → azonnali strukturált válasz, MINDEN út
+    // (auto_fallback, webclaw, flaresolverr) előtt: a Webclaw a konténeren
+    // belül fut (127.0.0.1-et érne el), a FlareSolverr a Railway belső hálóján.
+    // DNS-hibánál NEM zárunk rövidre (az auto_fallback Wayback-szintje egy
+    // megszűnt domain archív példányát még megtalálhatja).
+    {
+      const pre = await this._egressPrecheck(url);
+      if (pre?.blocked) return this._egressBlockedResult(url, pre.reason);
+    }
+
     if (options.auto_fallback === true) {
       return await this._scrapeAutoEscalation(url, options);
     }
@@ -495,7 +639,7 @@ export class BraveController {
         } catch (e) {
           lastErr = e;
           if (attempt < backoffs.length && this._isTransientBrowserError(e)) {
-            console.warn(`[retry] scrape browser-hiba (${attempt + 1}. kísérlet): ${e.message} — ${backoffs[attempt]}ms backoff`);
+            console.warn(`[retry] scrape browser-hiba (${attempt + 1}. kísérlet): ${redactUrls(e.message)} — ${backoffs[attempt]}ms backoff`);
             await BraveController._sleep(backoffs[attempt]);
             continue;
           }
@@ -577,11 +721,44 @@ export class BraveController {
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
       }
 
+      // 2026-09-22: a proxy mögött a Chrome DNS-hibája ERR_TUNNEL_CONNECTION_FAILED
+      // lenne — a régi hibaüzenetet (a hívók erre szűrhetnek) itt megőrizzük.
+      if (this._egressEnabled) {
+        const pre = await this._egressPrecheck(url);
+        if (pre?.dns) throw new Error(`net::ERR_NAME_NOT_RESOLVED at ${url}`);
+        if (pre?.blocked) return this._egressBlockedResult(url, pre.reason);
+      }
+      // Redirect belső címre: a fő navigációs kérés hostját figyeljük, hogy a
+      // proxy tiltását a hibához csatolhassuk.
+      const navT0 = Date.now();
+      let lastNavHost = null;
+      const onReq = (req) => {
+        try {
+          if (req.isNavigationRequest() && req.frame() === page.mainFrame()) lastNavHost = hostOnly(req.url());
+        } catch (_) {}
+      };
+      page.on('request', onReq);
+
       // Navigálás
-      await page.goto(url, {
-        waitUntil: options.waitUntil || 'networkidle2',
-        timeout: options.timeout || 30000
-      });
+      let navResp;
+      try {
+        navResp = await page.goto(url, {
+          waitUntil: options.waitUntil || 'networkidle2',
+          timeout: options.timeout || 30000
+        });
+      } catch (e) {
+        const reason = this._egress && lastNavHost && /ERR_TUNNEL_CONNECTION_FAILED/.test(String(e?.message))
+          ? this._egress.recentBlockFor(lastNavHost, navT0) : null;
+        if (reason) return this._egressBlockedResult(url, reason);
+        throw e;
+      } finally {
+        page.off('request', onReq);
+      }
+      {
+        let blockedReason = null;
+        try { blockedReason = navResp?.headers()?.[BLOCK_HEADER] || null; } catch (_) {}
+        if (blockedReason) return this._egressBlockedResult(url, blockedReason);
+      }
 
       // Várakozás további tartalomra
       if (options.waitForSelector) {
@@ -720,7 +897,7 @@ export class BraveController {
       if (excludePattern && new RegExp(excludePattern).test(url)) continue;
       
       try {
-        console.error(`Crawling: ${url}`);
+        console.error(`Crawling: host=${hostOnly(url)}`);
         const result = await this.scrape(url, { includeLinks: true });
         results.push(result);
 
@@ -736,7 +913,7 @@ export class BraveController {
           }
         }
       } catch (error) {
-        console.error(`Hiba ${url} crawl során: ${error.message}`);
+        console.error(`Hiba host=${hostOnly(url)} crawl során: ${redactUrls(error.message)}`);
       }
     }
 
@@ -832,7 +1009,7 @@ export class BraveController {
         // 0 találat → következő engine
       } catch (e) {
         // Engine timeout / hiba → következő engine
-        console.log(`⚠️  search engine ${engine.name} failed: ${e.message}`);
+        console.log(`⚠️  search engine ${engine.name} failed: ${redactUrls(e.message)}`);
       } finally {
         await page.close();
       }
@@ -847,11 +1024,16 @@ export class BraveController {
     // és párhuzamos ensureBrowser ne lásson félkész állapotot), a close() hibáját
     // záráskor nyeljük (egy már levált böngésző close()-a dobhat).
     if (this._watchdog) { clearInterval(this._watchdog); this._watchdog = null; }
+    // 2026-09-22: brave_page munkamenetek (profil-mentéssel) a böngésző előtt.
+    if (this._pageMgr) {
+      try { await BraveController._withTimeout(this._pageMgr.shutdown(), 4000, 'page-sessions'); } catch (_) {}
+    }
     const b = this.browser;
     this.browser = null;
     this._initPromise = null;
     // 2026-07-08: korlátos zárás — a shutdown sose lógjon egy beragadt close()-on.
     await this._disposeBrowser(b, 5000);
+    if (this._egress) { try { await this._egress.close(); } catch (_) {} }
   }
 
   async login(params) {
@@ -1875,6 +2057,7 @@ export class BraveController {
     this._interactiveCtx = null;
     this._interactivePage = null;
     this._initPromise = null;
+    this._pageMgr?.dropAll('browser_relaunched');
     await this._disposeBrowser(b, 2000);
     await this.ensureBrowser();
   }
@@ -1891,13 +2074,14 @@ export class BraveController {
     this.browser = null;
     this._interactiveCtx = null;
     this._interactivePage = null;
+    this._pageMgr?.dropAll('browser_recycled');
     await this._disposeBrowser(b);
   }
 
   // Minden új lap ezen át nyílik -> garantáltan él a böngésző.
   async newPage() {
     await this.ensureBrowser();
-    return this.browser.newPage();
+    return this._guardPage(await this.browser.newPage());
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -1987,7 +2171,8 @@ export class BraveController {
     // 2) idle kor-recycle: terhelés alatt a ScrapeGate.acquire() intézi; ha
     // viszont nincs forgalom, itt fogunk permitet és biztonságos ablakban
     // (egyedüli permit-birtokosként) újraindítjuk az öreg böngészőt.
-    if (this._scrapeGate._browserAged() && this._scrapeGate.active === 0) {
+    if (this._scrapeGate._browserAged() && this._scrapeGate.active === 0 &&
+        !this._pageSessionsHoldRecycle()) {
       await this._scrapeGate.acquire();
       try {
         if (this._scrapeGate.active === 1 && this._scrapeGate._browserAged()) {
@@ -2118,6 +2303,11 @@ export class BraveController {
       },
       probe_fail_streak: this._probeFailStreak,
       forced_relaunches: this._forcedRelaunches,
+      // 2026-09-22: egress-szűrő + brave_page munkamenetek
+      egress: this._egressEnabled
+        ? (this._egress ? this._egress.health() : { enabled: true, proxy_up: false })
+        : { enabled: false },
+      page_sessions: this._pageMgr ? this._pageMgr.health() : { sessions: 0 },
     };
   }
 
@@ -2161,7 +2351,7 @@ export class BraveController {
     }
     // Lap: kötött referencia. Ha bezárták/elszállt, nyiss frisset a SAJÁT contextben.
     if (!this._interactivePage || this._interactivePage.isClosed()) {
-      this._interactivePage = await this._interactiveCtx.newPage();
+      this._interactivePage = this._guardPage(await this._interactiveCtx.newPage());
     }
     try { await this._interactivePage.bringToFront(); } catch (e) {}
     return this._interactivePage;
@@ -2240,7 +2430,7 @@ export class BraveController {
         JSON.stringify({ domain, timestamp: Date.now(), cookies }, null, 2),
       );
     } catch (e) {
-      console.warn(`[cookie-jar] save failed for ${url}: ${e.message}`);
+      console.warn(`[cookie-jar] save failed for host=${hostOnly(url)}: ${redactUrls(e.message)}`);
     }
   }
 
@@ -2283,6 +2473,13 @@ export class BraveController {
   // Konfiguráció: FLARESOLVERR_URL env-vár (pl. http://flaresolverr.railway.internal:8191/v1)
   // FlareSolverr docker image: ghcr.io/flaresolverr/flaresolverr:latest
   async _scrapeViaFlareSolverr(url, options = {}) {
+    // 2026-09-22: a FlareSolverr a Railway BELSŐ hálóján fut és maga old fel —
+    // belső célt ne kérhessünk vele (a DNS-rebindinget itt nem zárjuk ki
+    // teljesen: a FlareSolverr újra felold; lásd devlog).
+    {
+      const pre = await this._egressPrecheck(url);
+      if (pre?.blocked) return this._egressBlockedResult(url, pre.reason);
+    }
     const flaresolverrUrl = process.env.FLARESOLVERR_URL;
     const maxTimeout = Math.min(options.timeout || 60000, 120000);
 
@@ -2404,6 +2601,12 @@ export class BraveController {
   // Konfiguráció: WEBCLAW_URL env-vár (pl. http://127.0.0.1:3000 lokál, vagy
   // Railway publikus URL). Stateless REST API: POST /v1/scrape.
   async _scrapeViaWebclaw(url, options = {}) {
+    // 2026-09-22: a Webclaw a konténerben (127.0.0.1) fut és maga old fel —
+    // loopback-célt (a Chrome DevTools-portja!) ne kérhessünk vele.
+    {
+      const pre = await this._egressPrecheck(url);
+      if (pre?.blocked) return this._egressBlockedResult(url, pre.reason);
+    }
     const webclawUrl = process.env.WEBCLAW_URL;
     const timeoutMs = Math.min(options.timeout || 30000, 60000);
 
@@ -2771,10 +2974,15 @@ export class BraveController {
     let availableUrl = null;
     try {
       const apiUrl = `https://archive.org/wayback/available?url=${encodeURIComponent(url)}`;
-      const resp = await fetch(apiUrl, {
-        method: 'GET',
-        signal: AbortSignal.timeout(15000),
-      });
+      // 2026-09-22: Node-oldali letöltés is az egress-ítéleten megy (ellenőrzött
+      // IP-re csatlakozik, redirectenként újraítél); kill-switchnél a régi fetch.
+      const g = this._egressEnabled ? await this._ensureEgress() : null;
+      const resp = g
+        ? await g.safeFetch(apiUrl, { timeoutMs: 15000, maxBytes: 1024 * 1024 })
+        : await fetch(apiUrl, {
+          method: 'GET',
+          signal: AbortSignal.timeout(15000),
+        });
       if (resp.ok) {
         const data = await resp.json();
         const closest = data?.archived_snapshots?.closest;

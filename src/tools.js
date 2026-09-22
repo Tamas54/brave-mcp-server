@@ -330,5 +330,81 @@ export const tools = [
     execute: async (controller, params) => {
       return await controller.visualInspect(params);
     }
+  },
+
+  {
+    name: 'brave_page',
+    description: 'Izolált böngésző-lap (saját inkognitó kontextus) Firecrawl-nevű actionökkel: wait, click (selector/text/x,y), write, press, scroll, screenshot, scrape, executeJavascript (CSAK a lapban), generatePDF, navigate. Kimenet: html/text/links/screenshot (JPEG, ~1.5 MB plafon). keep_session=true → session_id (tétlen TTL 300 s, abszolút 30 perc, max 4 egyszerre); profile → sütik+localStorage megőrzése névvel. Csak http/https; belső/loopback címek tiltva (blocked.reason). Egy hívás max ~25 s.',
+    handler: 'tools/call',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'http/https URL (kötelező, ha nincs session_id)' },
+        session_id: { type: 'string', description: 'Meglévő munkamenet folytatása' },
+        keep_session: { type: 'boolean', description: 'true → a válasz session_id-t ad, a lap nyitva marad (default false)' },
+        close: { type: 'boolean', description: 'A munkamenet lezárása a hívás végén (default false)' },
+        actions: {
+          type: 'array',
+          description: 'Sorban végrehajtott lépések. type: wait{milliseconds?,selector?} | click{selector?,text?,x?,y?,all?} | write{text,selector?} | press{key} | scroll{direction:up|down,amount?,selector?} | screenshot{fullPage?,quality?,viewport?{width,height}} | scrape | executeJavascript{script} | generatePDF{format?,landscape?,scale?} | navigate{url}',
+          items: {
+            type: 'object',
+            properties: {
+              type: { type: 'string', enum: ['wait', 'click', 'write', 'press', 'scroll', 'screenshot', 'scrape', 'executeJavascript', 'generatePDF', 'pdf', 'navigate'] },
+              milliseconds: { type: 'number' },
+              selector: { type: 'string' },
+              text: { type: 'string' },
+              x: { type: 'number' },
+              y: { type: 'number' },
+              all: { type: 'boolean' },
+              key: { type: 'string' },
+              direction: { type: 'string', enum: ['up', 'down'] },
+              amount: { type: 'number' },
+              fullPage: { type: 'boolean' },
+              quality: { type: 'number' },
+              viewport: { type: 'object', properties: { width: { type: 'number' }, height: { type: 'number' } } },
+              script: { type: 'string' },
+              format: { type: 'string' },
+              landscape: { type: 'boolean' },
+              scale: { type: 'number' },
+              url: { type: 'string' }
+            },
+            required: ['type']
+          }
+        },
+        formats: {
+          type: 'array',
+          items: { type: 'string', enum: ['html', 'text', 'links', 'screenshot'] },
+          description: 'Kimeneti formátumok (default ["html"])'
+        },
+        screenshot: {
+          type: 'object',
+          description: 'A screenshot formátum beállításai',
+          properties: {
+            fullPage: { type: 'boolean' },
+            quality: { type: 'number' },
+            viewport: { type: 'object', properties: { width: { type: 'number' }, height: { type: 'number' } } }
+          }
+        },
+        mobile: { type: 'boolean', description: 'Mobil-emuláció (default false)' },
+        headers: { type: 'object', description: 'Extra HTTP-fejlécek' },
+        locale: { type: 'string', description: 'pl. "hu-HU"' },
+        timezone: { type: 'string', description: 'pl. "Europe/Budapest"' },
+        block_ads: { type: 'boolean', description: 'Reklám/tracker hostok blokkolása (default true)' },
+        wait_ms: { type: 'number', description: 'Várakozás a betöltés után (ms, default 0)' },
+        timeout_ms: { type: 'number', description: 'Hívás-határidő (ms, max 25000)' },
+        profile: {
+          type: 'object',
+          description: 'Böngésző-profil: az azonos nevűek közös sütit/localStorage-t kapnak',
+          properties: {
+            name: { type: 'string', description: '1-128 karakter (+ a hívó névtere, pl. "<owner>:<név>"; max 256)' },
+            save_changes: { type: 'boolean', description: 'default true' }
+          },
+          required: ['name']
+        }
+      }
+    },
+    execute: async (controller, params) => {
+      return await controller.pageTool(params);
+    }
   }
 ];

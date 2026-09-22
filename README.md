@@ -353,6 +353,111 @@ Claus: [brave_mouse_control action='click' x=120 y=150]
 - Egyes szolgáltatók detektálhatják az automatizált egérmozgást
 - Használja felelősségteljesen a vizuális kontroll funkciókat
 
+## 🛡️ Egress-szűrő (SSRF-védelem, 2026-09-22)
+
+A Chromium MINDEN forgalma egy folyamaton belüli forward proxyn megy
+(`127.0.0.1:<véletlen port>`, `src/egress.js`). A proxy maga oldja fel a hostot
+(A + AAAA), elutasít minden nem-publikus címet, és a már ellenőrzött IP-re
+csatlakozik (DNS-rebinding ellen). Tiltva: loopback, privát (10/8, 172.16/12,
+192.168/16), link-local + felhő-metadata (169.254/16), CGNAT (100.64/10), 0/8,
+192.0.0/24, 198.18/15, dokumentációs tartományok, multicast, 240/4, broadcast,
+IPv6 ULA (fc00::/7 — a Railway belső hálója), link-local, loopback, unspecified,
+és minden IPv4-et beágyazó IPv6-alak (::ffff:0:0/96, 64:ff9b::/96 NAT64, ::/96,
+2002::/16 6to4, 2001::/32 Teredo) a beágyazott v4 szerint. Csak `http/https`
+navigáció (a `file://` a szerver env-jét adná ki).
+
+- A Chrome launch-flagjei: `--proxy-server=http://127.0.0.1:<port>`,
+  `--proxy-bypass-list=<-loopback>` (enélkül a localhostot megkerülné),
+  `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, `--disable-quic`.
+- Tiltott kérés: a proxy `403`-at ad `X-Brave-Egress-Blocked: <ok>` fejléccel.
+  `brave_scrape` → `{error:"egress_blocked", content_usable:false, blocked:{reason}}`;
+  `brave_page` → `blocked: {reason}`; `brave_navigate` → `egress_blocked:<ok>` hiba.
+- A Webclaw / FlareSolverr útvonal előtt is ellenőrzünk (a Webclaw a konténerben
+  fut, a FlareSolverr a belső hálón) — ezek viszont maguk oldanak fel, így náluk a
+  DNS-rebinding elméletileg nyitva marad.
+- Node-oldali letöltés (Wayback-API) is az ellenőrzött úton (`safeFetch`).
+
+| env | default | jelentés |
+|---|---|---|
+| `BRAVE_EGRESS_FILTER` | `1` | `0` = kill-switch: nincs proxy, régi viselkedés |
+| `BRAVE_EGRESS_DNS_CACHE_MS` | `30000` | ellenőrzött DNS-válaszok gyorsítótára |
+| `BRAVE_EGRESS_CONNECT_TIMEOUT_MS` | `10000` | upstream TCP-connect plafon |
+| `BRAVE_EGRESS_IDLE_TIMEOUT_MS` | `300000` | tétlen tunnel/stream bontása |
+| `BRAVE_EGRESS_ALLOW_TEST_LOOPBACK` | – | CSAK teszthez: `1` + `NODE_ENV=test` + nincs `RAILWAY_*` env → a 127.0.0.0/8 és ::1 engedett (élesben a Dockerfile `NODE_ENV=production`-je miatt nem kapcsolhat be) |
+
+Mért többletidő (lokál, 7 valós oldal, medián): brave_scrape +~70 ms, brave_page +~100 ms oldalanként.
+
+## 🧭 brave_page — izolált böngésző-lap Firecrawl-actionökkel
+
+Minden hívás (vagy munkamenet) saját inkognitó `BrowserContext`-ben fut: nem látja
+a scrape-sáv sütijeit, a `brave_login` munkameneteit, sem más munkamenetet.
+Letöltés tiltva, felugró ablak zárva, `alert/confirm` automatikusan lezárva.
+A hívás a meglévő concurrency-limiten (`BRAVE_MAX_CONCURRENCY`) osztozik, és a
+25 s-os `TOOL_CALL_TIMEOUT_MS` alatt saját határidővel részleges eredményt ad.
+
+**Bemenet** (a teljes szerződés: `KONTRAKTUS.md`, „brave-mcp ÚJ tool: brave_page"):
+
+```json
+{
+  "url": "https://example.com",
+  "keep_session": true,
+  "actions": [
+    {"type": "click", "text": "Elfogadom"},
+    {"type": "write", "selector": "#q", "text": "budapest"},
+    {"type": "press", "key": "Enter"},
+    {"type": "wait", "selector": ".results"},
+    {"type": "scroll", "direction": "down", "amount": 1200},
+    {"type": "screenshot", "fullPage": true, "quality": 70},
+    {"type": "executeJavascript", "script": "return document.title"},
+    {"type": "generatePDF", "format": "A4"},
+    {"type": "scrape"}
+  ],
+  "formats": ["html", "text", "links", "screenshot"],
+  "mobile": false, "locale": "hu-HU", "timezone": "Europe/Budapest",
+  "headers": {"X-Foo": "bar"}, "block_ads": true, "wait_ms": 0, "timeout_ms": 25000,
+  "profile": {"name": "owner:myprofile", "save_changes": true}
+}
+```
+
+Action-típusok: `wait {milliseconds?, selector?}`, `click {selector? | text? | x,y; all?}`,
+`write {text, selector?}`, `press {key}`, `scroll {direction, amount?, selector?}`,
+`screenshot {fullPage?, quality?, viewport?}`, `scrape`, `executeJavascript {script}`
+(CSAK a lapban fut — `page.evaluate`; `return` esetén függvénytestként),
+`generatePDF` / `pdf {format?, landscape?, scale?}`, `navigate {url}`.
+Az első hibás action után a többi `skipped`.
+
+**Kimenet** (a tool `content[0].text` JSON-ja):
+`{ok, session_id, url, final_url, status, title, html, text, links, screenshot,
+action_results[{type, ok, error?, screenshot?, html?, url?, js_result?, js_type?, pdf?, clicked?, status?}],
+blocked: {reason}|null, warnings[], elapsed_ms, error}` — minden vágás/kizárás
+(pl. `screenshot_quality_reduced`, `html_truncated`, `block_ads: N request(s) blocked`,
+`egress_blocked_subresources`, `popup_closed`) a `warnings`-ban látszik.
+
+**Munkamenetek:** `keep_session: true` → 128 bites `session_id`; tétlen TTL 300 s,
+abszolút 30 perc, egyszerre max `BRAVE_PAGE_MAX_SESSIONS` (4). A munkamenet a
+hívások között NEM foglal concurrency-slotot. Böngésző-recycle élő munkamenet
+alatt legfeljebb 20+30 percig halasztódik; utána `session_lost:browser_recycled`.
+
+**Profilok:** az azonos nevű profilok közös sütit + localStorage-t kapnak
+(storageState). A nevet a hívó névtere adja (az Echolot Engine `<owner>:<név>`
+alakban küldi). Egyszerre egy munkamenet menthet egy profilt (a többi csak olvas,
+warninggal). Tárolás: `BRAVE_PAGE_PROFILE_DIR` (default `.sessions/page-profiles/`,
+fájlnév = a név SHA-256-ja), LRU max `BRAVE_PAGE_MAX_PROFILES` (50).
+**Deploykor/konténer-cserekor a profilok elveszhetnek** (nincs volume).
+
+| env | default |
+|---|---|
+| `BRAVE_PAGE_MAX_SESSIONS` | `4` |
+| `BRAVE_PAGE_IDLE_TTL_MS` / `BRAVE_PAGE_ABS_TTL_MS` | `300000` / `1800000` |
+| `BRAVE_PAGE_MAX_PROFILES` / `BRAVE_PAGE_PROFILE_DIR` | `50` / `.sessions/page-profiles` |
+| `BRAVE_PAGE_SCREENSHOT_MAX_B64` | `1500000` (JPEG; minőség-lépcső 80→60→40→25, majd kicsinyítés) |
+| `BRAVE_PAGE_FULLPAGE_MAX_HEIGHT` | `10000` px |
+| `BRAVE_PAGE_PDF_MAX_B64` / `BRAVE_PAGE_MAX_HTML_CHARS` | `5000000` / `2000000` |
+
+**Tesztek:** `npm run test:node` (= `node --test test/`). A böngészős tesztek
+`BRAVE_PATH`-ot vagy egy telepített Chrome/Brave-et keresnek; a publikus részek
+hálózat nélkül kimaradnak.
+
 ## Session fájlok
 
 A bejelentkezési session-ök a `.sessions/` mappában tárolódnak. Ezek érzékeny adatok!
