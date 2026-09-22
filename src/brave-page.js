@@ -850,11 +850,23 @@ export class PageSessionManager {
       case 'executeJavascript': {
         if (typeof a.script !== 'string' || !a.script.trim()) { r.error = 'executeJavascript requires script'; return r; }
         if (a.script.length > 100000) { r.error = 'script too long (max 100000 chars)'; return r; }
-        // CSAK a lap kontextusában (Runtime.evaluate a lapban). Ha a script
-        // `return`-t használ, függvénytestként futtatjuk (Firecrawl-szokás).
-        const expr = /\breturn\b/.test(a.script) ? `(async () => {\n${a.script}\n})()` : a.script;
+        // CSAK a lap kontextusában (Runtime.evaluate a lapban).
+        // ⚠️ 2026-09-22, MÉRT hiba: a puszta `\breturn\b` mintára becsomagolni ROSSZ — egy
+        // IIFE (`(() => { ... return x; })()`), amiben a return egy BELSŐ függvényben van,
+        // így `(async () => { (()=>{...})() })()` lett, ami undefined-et ad (a hívó
+        // pillanatkép-szkriptje némán null-t kapott). Helyette: előbb KIFEJEZÉSKÉNT
+        // próbáljuk; csak SyntaxError esetén futtatjuk függvénytestként (Firecrawl-szokás:
+        // a `return`-nel kezdődő „script body" alak).
         let value;
-        await this._settleAfterInput(s, async () => { value = await page.evaluate(expr); }, deadline, reserveMs, warn);
+        await this._settleAfterInput(s, async () => {
+          try {
+            value = await page.evaluate(a.script);
+          } catch (e) {
+            const msg = String(e?.message || e);
+            if (!/SyntaxError|Illegal return statement|Unexpected token/i.test(msg)) throw e;
+            value = await page.evaluate(`(async () => {\n${a.script}\n})()`);
+          }
+        }, deadline, reserveMs, warn);
         let json;
         try { json = JSON.stringify(value); } catch (_) { json = undefined; }
         if (json !== undefined && json.length > this.limits.jsResultMaxChars) {

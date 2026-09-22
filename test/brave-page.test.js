@@ -175,6 +175,16 @@ test('executeJavascript: kifejezés, return-forma — és SOSEM Node-oldalon', {
   assert.equal(r.ok, true, r.error);
   assert.equal(r.action_results[0].js_result, 3);
   assert.equal(r.action_results[0].js_type, 'number');
+  // ⚠️ REGRESSZIÓ (2026-09-22, ÉLESBEN MÉRVE): az IIFE, amiben a `return` egy BELSŐ
+  // függvényben van, korábban némán undefined-et adott (a `\breturn\b` mintára
+  // függvénytestként futott). Az engine pillanatkép-szkriptje pont ilyen.
+  const rIife = await run({
+    url: `${fx.base}/page2`,
+    actions: [{ type: 'executeJavascript',
+                script: '(() => { const n = document.querySelectorAll("a").length; return JSON.stringify({ n, t: document.title }); })()' }],
+  });
+  assert.equal(rIife.action_results[0].ok, true, rIife.action_results[0].error);
+  assert.equal(JSON.parse(rIife.action_results[0].js_result).t, 'Second');
   assert.deepEqual(r.action_results[1].js_result, { t: 'Second', n: [1, 2] });
   // Node-oldali objektumok nem érhetők el: a lapban a process/require nem létezik.
   const r2 = await run({ url: `${fx.base}/page2`, actions: [{ type: 'executeJavascript', script: 'return typeof process + "/" + typeof require' }] });
