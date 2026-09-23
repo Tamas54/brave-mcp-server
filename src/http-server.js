@@ -8,6 +8,7 @@ import dotenv from 'dotenv';
 import { createRequire } from 'module';
 import crypto from 'crypto';
 import { hostOnly, redactUrls } from './egress.js';
+import { toolTimeoutMs } from './tool-timeout.js';
 
 const require = createRequire(import.meta.url);
 
@@ -439,23 +440,26 @@ app.post('/mcp', async (req, res) => {
       // 2026-05-14: wrap in TOOL_CALL_TIMEOUT_MS so a single stuck Puppeteer
       // page can't hang the request 30+s. Returns explicit JSONRPC -32000.
       const args = params?.arguments ?? {};
+      // 2026-09-23: tool-szintű határidő (lásd tool-timeout.js) — a brave_scrape
+      // flaresolverr/auto_fallback útja 160 s-ot kap, minden más marad 25 s.
+      const callTimeoutMs = toolTimeoutMs(toolName, args);
       let result;
       try {
         result = await trackInFlight(() => withTimeout(
           tool.execute(braveController, args),
-          TOOL_CALL_TIMEOUT_MS,
+          callTimeoutMs,
           `tools/call ${toolName}`
         ));
       } catch (err) {
         if (String(err.message || '').includes('timeout')) {
-          console.error(`⏱️ Tool ${toolName} timed out after ${TOOL_CALL_TIMEOUT_MS}ms`);
+          console.error(`⏱️ Tool ${toolName} timed out after ${callTimeoutMs}ms`);
           return res.status(504).json({
             jsonrpc: '2.0',
             id,
             error: {
               code: -32000,
-              message: `Tool ${toolName} timeout after ${TOOL_CALL_TIMEOUT_MS}ms`,
-              data: { tool: toolName, timeout_ms: TOOL_CALL_TIMEOUT_MS }
+              message: `Tool ${toolName} timeout after ${callTimeoutMs}ms`,
+              data: { tool: toolName, timeout_ms: callTimeoutMs }
             }
           });
         }
