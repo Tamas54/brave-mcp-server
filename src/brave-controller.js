@@ -620,7 +620,22 @@ export class BraveController {
     // ablakban. A newPage() a _scrapeOnce try-ján BELÜL nyílik -> ha dob, a
     // finally akkor is zárja a lapot, a külső finally pedig a permitet
     // (nincs szivárgás).
-    await this._scrapeGate.acquire();
+    // 2026-10-06: options.deadlineTs (abszolút ms, a crawl adja oldalanként) →
+    // a permitre is legfeljebb a határidőig várunk (a crawl ne álljon sorban
+    // a háttér-scrape-ek mögött a hívás-határidőn túl).
+    const deadlineTs = BraveController._deadlineOf(options);
+    if (deadlineTs) {
+      const wait = deadlineTs - Date.now();
+      if (wait <= 0) throw BraveController._pageDeadlineError('gate');
+      try {
+        await this._scrapeGate.acquire(wait);
+      } catch (e) {
+        if (e?.message === 'gate_timeout') throw BraveController._pageDeadlineError('gate');
+        throw e;
+      }
+    } else {
+      await this._scrapeGate.acquire();
+    }
     try {
       // ─── RETRY — 2026-07-05: 2 újrapróbálkozás exponenciális backoffal ──
       // (1s, 4s). CSAK browser-halál-osztályú hibákra (Protocol error /
@@ -638,7 +653,12 @@ export class BraveController {
           return result;
         } catch (e) {
           lastErr = e;
-          if (attempt < backoffs.length && this._isTransientBrowserError(e)) {
+          // Határidős (crawl) hívásnál csak akkor próbálunk újra, ha a backoff
+          // + egy rövid kísérlet még belefér; a saját határidő-lelövés sosem
+          // retry-zódik.
+          const retryFits = !deadlineTs || Date.now() + backoffs[attempt] + 1500 < deadlineTs;
+          if (attempt < backoffs.length && !e?.pageDeadline && retryFits &&
+              this._isTransientBrowserError(e)) {
             console.warn(`[retry] scrape browser-hiba (${attempt + 1}. kísérlet): ${redactUrls(e.message)} — ${backoffs[attempt]}ms backoff`);
             await BraveController._sleep(backoffs[attempt]);
             continue;
@@ -647,8 +667,13 @@ export class BraveController {
         }
       }
       this._scrapeFailCount++;
-      // Breakerbe csak a browser-halál / hung-browser osztály számít.
-      if (this._isBreakerCountableError(lastErr)) {
+      // Breakerbe csak a browser-halál / hung-browser osztály számít. A SAJÁT
+      // rövidített határidőnk (crawl oldal-timeout) lejárta NEM zombi-tünet —
+      // egy lassú site crawlja különben 5 oldal után a breakert nyitná, és
+      // 60 s-ra MINDEN hívót (Echolot-fetcher) kizárna.
+      const ownDeadline = lastErr?.pageDeadline ||
+        (deadlineTs && /Navigation timeout|TimeoutError|Timed out/i.test(String(lastErr?.message || '')));
+      if (!ownDeadline && this._isBreakerCountableError(lastErr)) {
         this._breaker.recordFailure();
       }
       throw lastErr;
@@ -686,9 +711,25 @@ export class BraveController {
     // MNB, ECB, DBnomics) ez tökéletes, mert ott nincs anti-bot-fal.
     const stealthMode = options.stealth === true;
 
+    // 2026-10-06: KEMÉNY OLDAL-HATÁRIDŐ (options.deadlineTs, a crawl adja).
+    // A határidőkor a lapot erőből zárjuk → minden függő await (goto,
+    // content, waitFor…) azonnal elhasal, és pageDeadline-hibává alakul. Így
+    // a lap SOSEM marad nyitva a határidőn túl, és a crawl nem lóg egy
+    // végtelenül töltődő oldalon.
+    const deadlineTs = BraveController._deadlineOf(options);
+    let killTimer = null;
+    let killed = false;
+
     let page;
     try {
       page = await this.newPage();
+      if (deadlineTs) {
+        const p = page;
+        killTimer = setTimeout(() => {
+          killed = true;
+          p.close().catch(() => {});
+        }, Math.max(0, deadlineTs - Date.now()));
+      }
       // ─── MEMÓRIA-DIÉTA — 2026-07-05: kép/font/media/tracker blokkolás ──
       // CSAK a scrape-sávon, CSAK ha nem kell screenshot és nem stealth mód
       // (a CF-challenge-feloldásnak teljes erőforrás-készlet kellhet).
@@ -741,10 +782,12 @@ export class BraveController {
 
       // Navigálás
       let navResp;
+      let navTimeout = options.timeout || 30000;
+      if (deadlineTs) navTimeout = Math.max(250, Math.min(navTimeout, deadlineTs - Date.now()));
       try {
         navResp = await page.goto(url, {
           waitUntil: options.waitUntil || 'networkidle2',
-          timeout: options.timeout || 30000
+          timeout: navTimeout
         });
       } catch (e) {
         const reason = this._egress && lastNavHost && /ERR_TUNNEL_CONNECTION_FAILED/.test(String(e?.message))
@@ -769,13 +812,56 @@ export class BraveController {
         await BraveController._sleep(options.waitTime);
       }
 
+      // 2026-10-06: korlátos „settle" (a crawl 'load' + ez; a networkidle2
+      // oldalanként +1–2,5 s-ot várt mérten, azonos markdownnal). Best-effort:
+      // ha a hálózat nem csendesedik el a kereten belül, megyünk tovább.
+      if (options.settleMs > 0) {
+        let t = options.settleMs;
+        if (deadlineTs) t = Math.min(t, deadlineTs - Date.now() - 300);
+        if (t >= 100) {
+          await page.waitForNetworkIdle({ idleTime: 500, timeout: t }).catch(() => {});
+        }
+      }
+
       // ─── Cloudflare-challenge auto-resolve — CSAK STEALTH MODE-BAN ─────
       // Default módon a happy-path-ot semmi nem lassítja. Egyetlen retry,
       // max 6s nav-timeout → worst-case +14s per scrape (csak ha CF challenge
       // tényleg ott van). Konzervatív indikátor-lista a `_isCloudflareChallenge`
       // helperben — false-positive minimalizálva.
       let cfStatus = stealthMode ? 'none' : 'skipped';
-      let html = await page.content();
+      // 2026-10-06: NEM-HTML szöveges dokumentum (text/markdown, text/plain,
+      // JSON, …): a Chrome ezekhez gyakran nem ad fő JS-kontextust → a
+      // rebrowser-patch „acquireContextId failed" hibát dobott a
+      // page.content()-en (mért: crawl.echolotnews.com/skill.md,
+      // /connect?format=md — a 21:09-es crawl-incidens két hibája), máskor
+      // <pre>-be csomagolva, turndown-escape-elve jött vissza. Ilyenkor a
+      // válasz NYERS törzse megy markdownként/szövegként: a crawlban MINDIG
+      // (preferRawText), a brave_scrape-ben csak ha a page.content() elhasal
+      // — a brave_scrape eddig sikeres útjai így bitre változatlanok.
+      let html = null;
+      let contentErr = null;
+      if (options.preferRawText !== true) {
+        try { html = await page.content(); } catch (e) { contentErr = e; }
+      }
+      if (html === null) {
+        const raw = killed ? null : await BraveController._textBodyOf(navResp);
+        if (raw) {
+          const finalUrl = page.url() || url;
+          return this._decorateContentFlags({
+            url: finalUrl,
+            title: '',
+            metadata: { title: '', url: finalUrl, contentType: raw.contentType },
+            markdown: raw.body,
+            text: raw.body,
+            html: options.includeHtml ? `<html><head></head><body><pre>${BraveController._escapeHtml(raw.body)}</pre></body></html>` : undefined,
+            links: options.includeLinks ? BraveController._markdownLinks(raw.body, finalUrl) : undefined,
+            content_type: raw.contentType,
+            cf_status: cfStatus,
+          });
+        }
+        if (contentErr) throw contentErr;
+        html = await page.content();
+      }
       if (stealthMode && this._isCloudflareChallenge(html)) {
         cfStatus = 'attempt_1';
         console.log('[CF] Challenge detected, waiting 8s for auto-resolve...');
@@ -837,14 +923,26 @@ export class BraveController {
       const markdown = this.turndownService.turndown(bodyHtml);
       const text = $('body').text().replace(/\s+/g, ' ').trim();
 
-      // Linkek gyűjtése
+      // Linkek gyűjtése — 2026-10-06: a VÉGSŐ (átirányítás utáni) URL-hez,
+      // ill. a <base href>-hez oldjuk fel, nem a kért URL-hez (tinyfish.io →
+      // www.tinyfish.ai: a relatív linkek eddig a régi hostra mutattak, és a
+      // crawl minden oldalon újra végigjárta a 301-láncot). Egy hibás href
+      // sem dönti be többé az egész scrape-et.
+      const finalUrl = page.url() || url;
+      let linkBase = finalUrl;
+      try {
+        const b = $('base[href]').attr('href');
+        if (b) linkBase = new URL(b, finalUrl).href;
+      } catch (_) { /* rossz <base> → végső URL */ }
       const links = [];
       $('a[href]').each((_, elem) => {
         const href = $(elem).attr('href');
         const text = $(elem).text().trim();
         if (href && !href.startsWith('#')) {
+          let abs;
+          try { abs = new URL(href, linkBase).href; } catch (_) { return; }
           links.push({
-            href: new URL(href, url).href,
+            href: abs,
             text: text || 'No text'
           });
         }
@@ -865,7 +963,13 @@ export class BraveController {
       // Content-flag dekorálás — content_usable + block_reason + markdown_warning
       return this._decorateContentFlags(result);
 
+    } catch (e) {
+      // A saját határidőnk zárta a lapot → egységes, felismerhető hiba (nem
+      // retry-zódik, nem nyitja a breakert).
+      if (killed) throw BraveController._pageDeadlineError('page');
+      throw e;
     } finally {
+      if (killTimer) clearTimeout(killTimer);
       // Lap-zárás MINDEN kimeneten (hiba esetén is). A scrape-lapok a default
       // BrowserContextben élnek — azt nem lehet/kell zárni, a page.close() a
       // teljes takarítás; a context-szintű nullázást a recycle végzi.
@@ -873,55 +977,222 @@ export class BraveController {
     }
   }
 
-  async crawl(startUrl, options = {}) {
-    const { 
-      maxPages = 10, 
-      sameDomain = true,
-      includePattern,
-      excludePattern 
-    } = options;
+  // ════════════════════════════════════════════════════════════════════
+  //  Határidő-segédek — 2026-10-06 (brave_crawl időkeret)
+  // ════════════════════════════════════════════════════════════════════
+  static _deadlineOf(options) {
+    const d = options?.deadlineTs;
+    return (typeof d === 'number' && Number.isFinite(d) && d > 0) ? d : 0;
+  }
 
-    const visited = new Set();
-    const toVisit = [startUrl];
-    const results = [];
-    const startDomain = new URL(startUrl).hostname;
+  static _pageDeadlineError(where) {
+    const e = new Error(`page_deadline_exceeded:${where}`);
+    e.pageDeadline = true;
+    return e;
+  }
 
-    while (toVisit.length > 0 && results.length < maxPages) {
-      const url = toVisit.shift();
-      
-      if (visited.has(url)) continue;
-      visited.add(url);
+  // Szöveges (nem-HTML) fő válasz törzse, vagy null. HTML-re null (az a
+  // rendes út), bináris típusra is null.
+  static async _textBodyOf(navResp) {
+    if (!navResp) return null;
+    let ct = '';
+    try { ct = String(navResp.headers()?.['content-type'] || '').toLowerCase(); } catch (_) { return null; }
+    const mime = ct.split(';')[0].trim();
+    if (!mime || mime === 'text/html' || mime === 'application/xhtml+xml') return null;
+    if (!/^text\//.test(mime) && !/^application\/(json|xml|javascript|ld\+json|[\w.-]+\+(json|xml))$/.test(mime)) return null;
+    try { return { contentType: mime, body: await navResp.text() }; } catch (_) { return null; }
+  }
 
-      // URL szűrés
-      if (includePattern && !new RegExp(includePattern).test(url)) continue;
-      if (excludePattern && new RegExp(excludePattern).test(url)) continue;
-      
+  static _escapeHtml(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // Markdown-linkek ([szöveg](url)) abszolút http(s) URL-re feloldva.
+  static _markdownLinks(md, base) {
+    const out = [];
+    const re = /\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g;
+    let m;
+    while ((m = re.exec(String(md || ''))) && out.length < 2000) {
       try {
-        console.error(`Crawling: host=${hostOnly(url)}`);
-        const result = await this.scrape(url, { includeLinks: true });
-        results.push(result);
-
-        // Új linkek hozzáadása
-        if (result.links) {
-          for (const link of result.links) {
-            const linkUrl = new URL(link.href);
-            
-            if (sameDomain && linkUrl.hostname !== startDomain) continue;
-            if (!visited.has(link.href) && !toVisit.includes(link.href)) {
-              toVisit.push(link.href);
-            }
-          }
+        const u = new URL(m[2], base);
+        if (u.protocol === 'http:' || u.protocol === 'https:') {
+          out.push({ href: u.href, text: m[1].trim() || 'No text' });
         }
+      } catch (_) { /* nem URL */ }
+    }
+    return out;
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  brave_crawl — 2026-10-06: IDŐKERETES, RÉSZEREDMÉNYES bejárás
+  // ════════════════════════════════════════════════════════════════════
+  // A régi crawl időkeret nélkül, szekvenciálisan járt be (mért élesen:
+  // ~1,6–2,2 s/oldal networkidle2-vel), a tool-határidő (25 s) pedig a TELJES
+  // eredményt eldobta (504, nulla oldal), miközben a crawl a háttérben árván
+  // futott tovább (mért: +12 scrape a 504 után). Mostantól:
+  //   • budgetMs (a tools.js a hívás-határidőből számolja) → a crawl a kereten
+  //     belül befejezi magát, és visszaadja, amit addig begyűjtött
+  //     (truncated + stop_reason + pending_urls);
+  //   • oldalanként saját határidő (pageTimeoutMs, default 10 s) — a scrape a
+  //     határidőkor a lapot erőből zárja; a lassú oldal az errors-ba kerül,
+  //     a crawl megy tovább;
+  //   • 'load' + korlátos settle a networkidle2 helyett (mért: 2–7× gyorsabb
+  //     navigáció, azonos markdown);
+  //   • URL-normalizálás: #fragment le, csak http(s), bináris kiterjesztés
+  //     kihagyva, www-független host-egyezés, és az átirányítás utáni host is
+  //     „saját" (tinyfish.io → www.tinyfish.ai).
+  async crawl(startUrl, options = {}) {
+    const t0 = Date.now();
+    const intOpt = (v, lo, hi, d) => {
+      const n = Number(v);
+      return (v !== undefined && v !== null && v !== '' && Number.isFinite(n))
+        ? Math.min(hi, Math.max(lo, Math.floor(n))) : d;
+    };
+    const maxPages = intOpt(options.maxPages, 1, BraveController.CRAWL_MAX_PAGES_CAP, 10);
+    const sameDomain = options.sameDomain !== false;
+    const budgetMs = intOpt(options.budgetMs, 1000, 15 * 60 * 1000,
+      intOpt(process.env.BRAVE_CRAWL_BUDGET_MS, 1000, 15 * 60 * 1000, 20000));
+    const pageTimeoutMs = intOpt(options.pageTimeoutMs, 1000, 60000,
+      intOpt(process.env.BRAVE_CRAWL_PAGE_TIMEOUT_MS, 1000, 60000, 10000));
+    const settleMs = intOpt(options.settleMs, 0, 10000, 1000);
+    const waitUntil = ['load', 'domcontentloaded', 'networkidle0', 'networkidle2'].includes(options.waitUntil)
+      ? options.waitUntil : 'load';
+    const deadline = t0 + budgetMs;
+    // Ennyi hátralévő idő alatt nem kezdünk új oldalt (úgysem érne célba);
+    // kis keretnél arányosan kevesebb, hogy a keret ne menjen kárba.
+    const minStartMs = Math.min(1500, Math.floor(pageTimeoutMs / 2), Math.floor(budgetMs / 4));
+    // A scrape a saját határidejét a lap zárásával tartja; ez a kemény
+    // védőháló arra az esetre, ha a lapnyitás ELŐTT akadna el (kapu,
+    // böngésző-recycle, hung ensureBrowser).
+    const HARD_GRACE_MS = 1500;
+
+    const finish = (extra) => ({
+      startUrl,
+      crawledPages: 0,
+      results: [],
+      truncated: false,
+      elapsed_ms: Date.now() - t0,
+      ...extra,
+    });
+    let include = null;
+    let exclude = null;
+    try {
+      if (options.includePattern) include = new RegExp(options.includePattern);
+      if (options.excludePattern) exclude = new RegExp(options.excludePattern);
+    } catch (e) {
+      return finish({ error: 'invalid_pattern', message: e.message, stop_reason: 'invalid_pattern' });
+    }
+    const start = BraveController._crawlNormalizeUrl(startUrl);
+    if (!start) {
+      return finish({ error: 'invalid_start_url', stop_reason: 'invalid_start_url' });
+    }
+
+    const hostKey = BraveController._crawlHostKey;
+    const allowedHosts = new Set([hostKey(new URL(start).hostname)]);
+    const seen = new Set([start]);   // sorba tett VAGY bejárt (normalizált) URL-ek
+    const queue = [start];
+    const results = [];
+    const errors = [];
+    let stopReason = null;
+    let skippedByPattern = 0;
+
+    for (;;) {
+      if (results.length >= maxPages) { stopReason = 'max_pages'; break; }
+      if (queue.length === 0) { stopReason = 'queue_exhausted'; break; }
+      const remaining = deadline - Date.now();
+      if (remaining < minStartMs) { stopReason = 'time_budget'; break; }
+
+      const url = queue.shift();
+      // URL-szűrés (a régi szemantika: a startUrl-re is vonatkozik)
+      if ((include && !include.test(url)) || (exclude && exclude.test(url))) {
+        skippedByPattern++;
+        continue;
+      }
+
+      const pageDeadline = Date.now() + Math.min(pageTimeoutMs, remaining);
+      console.error(`Crawling: host=${hostOnly(url)}`);
+      const scrapeP = this.scrape(url, { includeLinks: true, waitUntil, settleMs, deadlineTs: pageDeadline, preferRawText: true });
+      scrapeP.catch(() => {});   // a védőháló által elhagyott ígéret se legyen unhandled
+      let result;
+      try {
+        result = await BraveController._withTimeout(
+          scrapeP, Math.max(0, pageDeadline - Date.now()) + HARD_GRACE_MS, 'crawl_page');
       } catch (error) {
-        console.error(`Hiba host=${hostOnly(url)} crawl során: ${redactUrls(error.message)}`);
+        const msg = String(error?.message || error);
+        const timedOut = error?.pageDeadline || /crawl_page timeout|Navigation timeout|TimeoutError/i.test(msg);
+        errors.push({ url, error: timedOut ? 'page_timeout' : redactUrls(msg).slice(0, 200) });
+        console.error(`Hiba host=${hostOnly(url)} crawl során: ${timedOut ? 'page_timeout' : redactUrls(msg)}`);
+        continue;
+      }
+
+      // Strukturált (nem dobott) hibák: a breaker nyitva → a további oldalak
+      // is azonnal buknának, megállunk; egress-tiltás → kihagyjuk az oldalt.
+      if (result?.error === 'brave_down') {
+        errors.push({ url, error: 'brave_down', retry_after: result.retry_after });
+        stopReason = 'brave_down';
+        break;
+      }
+      if (result?.error === 'egress_blocked') {
+        errors.push({ url, error: 'egress_blocked', reason: result.blocked?.reason });
+        continue;
+      }
+
+      // Az átirányítás utáni URL is „bejárt", a start-oldal végső hostja „saját".
+      const finalUrl = BraveController._crawlNormalizeUrl(result?.url) || url;
+      seen.add(finalUrl);
+      if (url === start) allowedHosts.add(hostKey(new URL(finalUrl).hostname));
+
+      const links = Array.isArray(result?.links) ? result.links : [];
+      for (const link of links) {
+        const n = BraveController._crawlNormalizeUrl(link?.href);
+        if (!n || seen.has(n)) continue;
+        const nu = new URL(n);
+        if (sameDomain && !allowedHosts.has(hostKey(nu.hostname))) continue;
+        if (BraveController.CRAWL_SKIP_EXT.test(nu.pathname)) continue;
+        seen.add(n);
+        queue.push(n);
+      }
+
+      if (options.includeLinks === true) {
+        results.push(result);
+      } else {
+        const { links: _omit, ...rest } = result || {};
+        results.push({ ...rest, links_found: links.length });
       }
     }
 
-    return {
-      startUrl,
+    const out = finish({
       crawledPages: results.length,
-      results
-    };
+      results,
+      // truncated = az időkeret vágta el (maradt be nem járt oldal); a
+      // maxPages elérése kért korlát, nem csonkolás.
+      truncated: stopReason === 'time_budget',
+      stop_reason: stopReason,
+      pending_urls: queue.length,
+      errors,
+      budget_ms: budgetMs,
+      page_timeout_ms: pageTimeoutMs,
+      ...(skippedByPattern ? { skipped_by_pattern: skippedByPattern } : {}),
+    });
+    console.error(
+      `[crawl] host=${hostOnly(start)} pages=${out.crawledPages} errors=${errors.length} ` +
+      `stop=${stopReason} pending=${queue.length} ms=${out.elapsed_ms} budget=${budgetMs}`
+    );
+    return out;
+  }
+
+  // Crawl-URL normalizálás: abszolút http(s), #fragment nélkül; különben null.
+  static _crawlNormalizeUrl(href, base) {
+    let u;
+    try { u = base ? new URL(String(href), base) : new URL(String(href)); } catch (_) { return null; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    u.hash = '';
+    return u.href;
+  }
+
+  // Host-kulcs a sameDomain-egyezéshez: kisbetűs, „www." nélkül.
+  static _crawlHostKey(host) {
+    return String(host || '').toLowerCase().replace(/^www\./, '');
   }
 
   async search(query, options = {}) {
@@ -3127,3 +3398,7 @@ BraveController.UA_POOL = [
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
 ];
+// 2026-10-06: brave_crawl — oldalszám-plafon és a bejárásból kihagyott
+// (nem-szöveges) kiterjesztések. A .md/.txt marad (szöveg-fallback kezeli).
+BraveController.CRAWL_MAX_PAGES_CAP = 100;
+BraveController.CRAWL_SKIP_EXT = /\.(pdf|png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?|zip|gz|tgz|bz2|xz|rar|7z|tar|mp3|mp4|m4a|wav|ogg|webm|mov|avi|mkv|woff2?|ttf|otf|eot|css|js|mjs|map|dmg|exe|msi|apk|deb|rpm|iso|bin)$/i;

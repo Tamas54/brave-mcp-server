@@ -1,3 +1,5 @@
+import { crawlBudgetMs } from './tool-timeout.js';
+
 export const tools = [
   {
     name: 'brave_navigate',
@@ -84,7 +86,7 @@ export const tools = [
 
   {
     name: 'brave_crawl',
-    description: 'Weboldal crawl-olása (több oldal bejárása)',
+    description: 'Weboldal crawl-olása (több oldal bejárása, azonos domainen). Időkeretes: a hívás-határidőn (alapból ~25 s) belül MINDIG visszatér azzal, amit addig begyűjtött — ha nem fért bele minden oldal, truncated=true, stop_reason="time_budget", pending_urls = a be nem járt sor hossza. Oldalanként saját timeout; a hibás/lassú oldalak az errors listába kerülnek, a crawl megy tovább.',
     handler: 'tools/call',
     inputSchema: {
       type: 'object',
@@ -95,7 +97,15 @@ export const tools = [
         },
         maxPages: {
           type: 'number',
-          description: 'Maximum oldalszám (alapértelmezett: 10)'
+          description: 'Maximum oldalszám (alapértelmezett: 10, plafon: 100). Nagy értéknél az időkeret a valódi korlát — a válasz ilyenkor truncated=true.'
+        },
+        pageTimeoutMs: {
+          type: 'number',
+          description: 'Oldalankénti időkorlát ms-ban (alapértelmezett: 10000, 1000–60000). A lassú oldal hibaként kerül az errors listába, a crawl megy tovább.'
+        },
+        includeLinks: {
+          type: 'boolean',
+          description: 'Oldalanként a talált linkek listája is (alapértelmezett: false — a válasz enélkül jóval kisebb).'
         },
         sameDomain: {
           type: 'boolean',
@@ -113,7 +123,10 @@ export const tools = [
       required: ['startUrl']
     },
     execute: async (controller, params) => {
-      return await controller.crawl(params.startUrl, params);
+      // 2026-10-06: időkeret a hívás-határidőből (lásd tool-timeout.js) — a
+      // crawl ezen belül részeredménnyel tér vissza, sosem lövi le a 504.
+      const p = (params && typeof params === 'object') ? params : {};
+      return await controller.crawl(p.startUrl, { ...p, budgetMs: crawlBudgetMs(p) });
     }
   },
 

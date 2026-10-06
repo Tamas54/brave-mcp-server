@@ -479,8 +479,9 @@ Weboldal tartalmának kinyerése Brave böngészővel
 
 #### 2. **brave_crawl** - Website Crawling  
 Több oldal bejárása ugyanazon domain-en
-- **Paraméterek:** `startUrl` (kötelező), `maxPages`, `sameDomain`, `includePattern`, `excludePattern`
-- **Visszaad:** Crawled pages array with content
+- **Paraméterek:** `startUrl` (kötelező), `maxPages` (default 10, plafon 100), `sameDomain`, `includePattern`, `excludePattern`, `pageTimeoutMs` (default 10000), `includeLinks` (default false)
+- **Visszaad:** `results[]` (markdown, text, metadata, `links_found`), `truncated`, `stop_reason` (`max_pages` | `queue_exhausted` | `time_budget` | `brave_down`), `pending_urls`, `errors[]`, `elapsed_ms`, `budget_ms`
+- **Időkeret (2026-10-06):** a crawl a hívás-határidőn belül (`TOOL_TIMEOUT_CRAWL_MS`, alapból = `TOOL_CALL_TIMEOUT_MS` 25 s, mínusz `TOOL_CRAWL_MARGIN_MS` 4 s) MINDIG visszatér azzal, amit addig begyűjtött (`truncated=true`); oldalanként saját határidő, a lap a határidőkor erőből záródik. `load` + legfeljebb 1 s hálózati csend (nem `networkidle2`). `#fragment`-dedup, átirányítás utáni host is „saját", nem-HTML szöveg (`text/markdown`, `text/plain`, JSON) nyers törzsként.
 - **Példa:** `Crawl-old a https://example.com domain-t maxPages=5 paraméterrel`
 
 #### 3. **brave_search** - Brave Search

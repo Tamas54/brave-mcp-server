@@ -21,5 +21,27 @@ export function toolTimeoutMs(toolName, args, env = process.env) {
     // A lánc worst-case ~150 s + tartalék. Sosem rövidebb az alapnál.
     return Math.max(base, envInt(env, 'TOOL_TIMEOUT_SCRAPE_SLOW_MS', 160000));
   }
+  if (toolName === 'brave_crawl') {
+    // 2026-10-06: a crawl saját plafont kaphat (alapból = az alap 25 s). A
+    // crawl a plafonon BELÜL részeredménnyel tér vissza (crawlBudgetMs).
+    return envInt(env, 'TOOL_TIMEOUT_CRAWL_MS', base);
+  }
   return base;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  brave_crawl időkerete — 2026-10-06
+// ════════════════════════════════════════════════════════════════════
+// MIÉRT: a crawl szekvenciálisan, oldalanként ~1,5–5 s-ot tölt (mért), és
+// eddig NEM volt időkerete → ~12–15 oldal fölött a 25 s-os hívás-határidő
+// mindig lelőtte, a hívó 504-et kapott NULLA eredménnyel, a crawl pedig a
+// háttérben árván futott tovább. Mostantól a crawl a hívás-határidő MÍNUSZ
+// tartalék alatt befejezi magát, és amit addig begyűjtött, visszaadja
+// (truncated=true). A tartalék fedezi az utolsó lap kemény levágását és a
+// JSON-válasz összeállítását.
+export function crawlBudgetMs(args, env = process.env) {
+  const ceiling = toolTimeoutMs('brave_crawl', args, env);
+  const margin = envInt(env, 'TOOL_CRAWL_MARGIN_MS', 4000);
+  // Legalább 3 s munkaidő akkor is, ha a plafon kicsi (teszt / rossz env).
+  return Math.max(3000, ceiling - margin);
 }
