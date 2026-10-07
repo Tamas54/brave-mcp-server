@@ -14,6 +14,9 @@ import {
   BLOCK_HEADER, hostOnly, redactUrls,
 } from './egress.js';
 import { PageSessionManager } from './brave-page.js';
+import { solveOnReadPath, solverEnabled as captchaSolverEnabled } from './captcha/read-path.js';
+import { fromHumanInput } from './captcha/pointer.js';
+import { toolTimeoutMs } from './tool-timeout.js';
 import {
   tfEvasionsEnabled, tfEvasionsPlugin, pruneSupersededEvasions, applyTfPersona, tfHealth,
 } from './stealth/tf-evasions/index.js';
@@ -822,6 +825,7 @@ export class BraveController {
     // overhead. A statdata-jellegű JS-rendered forrásokra (Eurostat,
     // MNB, ECB, DBnomics) ez tökéletes, mert ott nincs anti-bot-fal.
     const stealthMode = options.stealth === true;
+    const scrapeT0 = Date.now();
 
     // 2026-10-06: KEMÉNY OLDAL-HATÁRIDŐ (options.deadlineTs, a crawl adja).
     // A határidőkor a lapot erőből zárjuk → minden függő await (goto,
@@ -1060,6 +1064,23 @@ export class BraveController {
         }
       }
 
+      // ─── C2 — SAJÁT CAPTCHA-MEGOLDÓ, CSAK OLVASÁSI ÚT — 2026-10-07 ──────
+      // A purpose itt KÓDBAN rögzített 'read' (brave_scrape / brave_crawl /
+      // auto_fallback-fokok); a hívó paramétere nem írhatja felül. Kikapcsolva
+      // (CAPTCHA_SOLVER_ENABLED, alap KI) a hívás azonnal null — az út bitre a
+      // régi. Határidő: a crawl oldal-határideje, különben a tool-hívás plafonja
+      // mínusz tartalék (a 25 s-os külső vágás előtt végezzünk).
+      let captchaInfo = null;
+      if (!killed && captchaSolverEnabled()) {
+        const capDeadline = deadlineTs || (scrapeT0 + toolTimeoutMs('brave_scrape', options) - 4000);
+        // a W2 „keze" (HumanInput, egy böngésző = egy mag), ha a vezérlőn már van
+        const human = typeof this._humanInput === 'function' ? (fromHumanInput(this._humanInput()) || undefined) : undefined;
+        captchaInfo = await solveOnReadPath(page, { purpose: 'read', deadlineTs: capDeadline, human, op: options.captchaOp === 'crawl' ? 'crawl' : 'scrape' });
+        if (captchaInfo?.status === 'solved') {
+          try { html = await page.content(); } catch (e) { if (killed) throw e; }
+        }
+      }
+
       // Cookie-jar save — csak stealth módban, ha bármi clearance cookie
       // keletkezett. Default módban nem mentünk semmit.
       if (stealthMode) {
@@ -1121,6 +1142,8 @@ export class BraveController {
 
       const result = {
         url: page.url(),
+        // C2: csak ha CAPTCHA volt a lapon (additív mező)
+        ...(captchaInfo ? { captcha: captchaInfo } : {}),
         title: metadata.title,
         metadata,
         markdown,
@@ -1290,7 +1313,7 @@ export class BraveController {
 
       const pageDeadline = Date.now() + Math.min(pageTimeoutMs, remaining);
       console.error(`Crawling: host=${hostOnly(url)}`);
-      const scrapeP = this.scrape(url, { includeLinks: true, waitUntil, settleMs, deadlineTs: pageDeadline, preferRawText: true });
+      const scrapeP = this.scrape(url, { includeLinks: true, waitUntil, settleMs, deadlineTs: pageDeadline, preferRawText: true, captchaOp: 'crawl' });
       scrapeP.catch(() => {});   // a védőháló által elhagyott ígéret se legyen unhandled
       let result;
       try {

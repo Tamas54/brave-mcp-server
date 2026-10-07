@@ -451,6 +451,7 @@ export const tools = [
         timezone: { type: 'string', description: 'pl. "Europe/Budapest"' },
         block_ads: { type: 'boolean', description: 'Reklám/tracker hostok blokkolása (default true)' },
         wait_ms: { type: 'number', description: 'Várakozás a betöltés után (ms, default 0)' },
+        purpose: { type: 'string', enum: ['read'], description: '"read": egyszeri olvasó hívás — a nyitó CAPTCHA-falat a saját megoldó átlépi (ha a szerveren be van kapcsolva); munkamenetben hatástalan' },
         timeout_ms: { type: 'number', description: 'Hívás-határidő (ms, max 25000)' },
         profile: {
           type: 'object',
