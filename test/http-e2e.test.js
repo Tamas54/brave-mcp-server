@@ -131,7 +131,9 @@ test('HTTP e2e — szigorú egress + napló-redakció', { skip, timeout: 180000 
     // 2026-10: az example.com szövege megváltozott (a címsor helyett többnyelvű
     // bekezdés) — mindkét alakot elfogadjuk.
     assert.match(pub.text, /Example Domain|documentation examples/);
-    for (const v of pub.action_results[0].js_result) assert.match(v, /^403:blocked_ip:127\.0\.0\.1$/);
+    // W2 (2026-10-07): web-security alapból BE → az idegen origin válasza
+    // olvashatatlan ('ERR'); --disable-web-security mellett a proxy 403-ja látszik.
+    for (const v of pub.action_results[0].js_result) assert.match(v, /^(403:blocked_ip:127\.0\.0\.1|ERR)$/);
   }
 
   // Napló: egy sor/kérés, host igen — titok, query, törzs, fejléc NEM.

@@ -18,6 +18,13 @@ import {
   tfEvasionsEnabled, tfEvasionsPlugin, pruneSupersededEvasions, applyTfPersona, tfHealth,
 } from './stealth/tf-evasions/index.js';
 import { peMinimalEnabled, prunePeMinimal, peMinimalHealth } from './stealth/pe-minimal.js';
+// 2026-10-07 (W2 „falon át"): challenge-kivárás / checkbox / megoldó-horog,
+// emberi bemenet, WebRTC-zár egress nélkül is.
+import {
+  challengeConfig, challengeHealth, detectChallengeHtml, handleChallenge, clearanceCookies,
+} from './challenge.js';
+import { HumanInput, humanizeEnabled, humanizeSeed } from './stealth/humanize.js';
+import { preloadProviders, captchaSolverHealth } from './captcha/provider.js';
 
 const execFileP = promisify(execFile);
 
@@ -233,10 +240,14 @@ export class BraveController {
     
     // Felesleges elemek eltávolítása
     this.turndownService.remove(['script', 'style', 'nav', 'footer', 'iframe']);
+    // 2026-10-07 (W2): a CAPTCHA_SOLVER_PROVIDER-ben megnevezett szolgáltatók
+    // betöltése (best-effort) — a /health így a valós regisztrációt mutatja.
+    preloadProviders().catch(() => {});
   }
 
   async initialize() {
     const bravePath = process.env.BRAVE_PATH || this.detectBravePath();
+    this._exePath = bravePath;
 
     let launched;
     try {
@@ -380,7 +391,14 @@ export class BraveController {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-gpu',
-        '--disable-web-security',
+        // 2026-10-07 (W2): a --disable-web-security KIKERÜLT (alapból) — mérve a
+        // Cloudflare-challenge ezen bukott el (headed Xvfb-n: a flaggel a
+        // checkbox-kattintás után is visszadob, nélküle 7 s alatt kattintás
+        // nélkül átenged), ráadásul a same-origin policy kikapcsolása biztonsági
+        // rés is volt (egy lap más originek válaszait olvashatta). Semmi nem
+        // épített rá (a kezdeti commit óta ült itt). Visszakapcsolás:
+        // BRAVE_DISABLE_WEB_SECURITY=1.
+        ...(/^(1|true|on|yes)$/i.test(String(process.env.BRAVE_DISABLE_WEB_SECURITY || '').trim()) ? ['--disable-web-security'] : []),
         '--disable-dev-shm-usage',
         '--disable-infobars',
         '--disable-extensions-except=',
@@ -390,8 +408,34 @@ export class BraveController {
         '--enable-features=NetworkService,NetworkServiceInProcess',
         // 2026-09-22: egress-szűrő (proxy + loopback-kivétel törlése + WebRTC/QUIC zár).
         ...(this._egressEnabled && this._egress?.port ? chromeEgressArgs(this._egress.port) : []),
+        // 2026-10-07 (W2): a WebRTC-zár az egress-szűrő NÉLKÜL is (kill-switch
+        // alatt a nem proxyzott UDP a valódi IP-t adná ki) — a Scrapling
+        // `block_webrtc` flagjei. STEALTH_WEBRTC=native kapcsolja ki.
+        ...(BraveController._webrtcBlockArgs(this._egressEnabled && this._egress?.port)),
       ]
     });
+  }
+
+  // A WebRTC-zár flagjei, ha az egress-szűrő nem adja (tiszta, tesztelhető).
+  static _webrtcBlockArgs(egressOn, env = process.env) {
+    if (egressOn) return [];
+    if (String(env.STEALTH_WEBRTC || '').trim().toLowerCase() === 'native') return [];
+    return ['--force-webrtc-ip-handling-policy=disable_non_proxied_udp', '--webrtc-ip-handling-policy=disable_non_proxied_udp'];
+  }
+
+  // Egy böngésző-indítás = egy „kéz" (egérpálya-stílus, kattintás- és gépelési
+  // ritmus egy magból). Recycle / relaunch → új mag (új munkamenet-persona).
+  _humanInput() {
+    const key = this._browserLaunchTs || 0;
+    if (!this._human || this._humanKey !== key) {
+      this._human = new HumanInput(humanizeSeed());
+      this._humanKey = key;
+    }
+    return this._human;
+  }
+
+  _humanizeOn() {
+    return humanizeEnabled();
   }
 
   // 2026-06-29: STATEFUL navigáció a PERZISZTENS lapon (getCurrentPage).
@@ -805,9 +849,17 @@ export class BraveController {
       if (!stealthMode && !options.screenshot) {
         await this._applyScrapeDiet(page);
       }
+      // 2026-10-07 (W2): egy korábban megnyert challenge átengedő sütijei + a
+      // hozzájuk tartozó UA (a clearance UA-hoz kötött: más UA-val a védelem
+      // újra challenge-et ad) → a következő scrape challenge nélkül megy át.
+      // Csak ha a challenge-kezelés BE van (CHALLENGE_WAIT_MS > 0).
+      const chCfg = challengeConfig();
+      const clearance = chCfg.waitMs > 0 && chCfg.clearanceTtlMs > 0
+        ? await this._loadClearance(url, chCfg.clearanceTtlMs) : null;
       if (stealthMode) {
         // Random UA + viewport — Cloudflare TLS-fingerprint statisztikát megtöri.
-        const ua = BraveController.UA_POOL[
+        // (Élő clearance mellett a hozzá tartozó UA — persona-konzisztencia.)
+        const ua = clearance?.ua || BraveController.UA_POOL[
           Math.floor(Math.random() * BraveController.UA_POOL.length)
         ];
         // 2026-10-07: TF-kapcsolóval a pool-UA-ból legfeljebb az OS számít
@@ -841,8 +893,12 @@ export class BraveController {
         // Default fast-path UA — a meglévő viselkedés (statdata path).
         // TF-kapcsolóval: persona a futó böngésző verziójával (a fix Chrome/120
         // a valódi motorhoz képest ~34 verzióval öregebb).
-        if (TF_EVASIONS) await applyTfPersona(page, { uaHint: BraveController.DEFAULT_SCRAPE_UA });
-        else await page.setUserAgent(BraveController.DEFAULT_SCRAPE_UA);
+        const ua = clearance?.ua || BraveController.DEFAULT_SCRAPE_UA;
+        if (TF_EVASIONS) await applyTfPersona(page, { uaHint: ua });
+        else await page.setUserAgent(ua);
+      }
+      if (clearance?.cookies?.length) {
+        await page.setCookie(...clearance.cookies).catch(() => {});
       }
 
       // 2026-09-22: a proxy mögött a Chrome DNS-hibája ERR_TUNNEL_CONNECTION_FAILED
@@ -945,7 +1001,39 @@ export class BraveController {
         if (contentErr) throw contentErr;
         html = await page.content();
       }
-      if (stealthMode && this._isCloudflareChallenge(html)) {
+      // ─── JS-challenge / interstitial — 2026-10-07 (W2) ────────────────
+      // Minden szinten (default + stealth): a betöltött lapon Cloudflare
+      // „Just a moment…" / DataDome / PerimeterX / Imperva / Akamai / checkbox-
+      // kapu → kivárás a jel eltűnéséig (navigáció-figyeléssel, határidő-
+      // tudatosan), CHALLENGE_SOLVE=1 mellett checkbox-kattintás emberi
+      // mozdulattal, aktív megoldó-szolgáltatóval (CAPTCHA_SOLVER_PROVIDER) a
+      // megoldó-horog. A válaszban `challenge: {type, waited_ms, passed, …}`.
+      // Normál lapon (nincs jel) 0 többletidő. CHALLENGE_WAIT_MS=0 → a régi út.
+      let challengeInfo = null;
+      if (chCfg.waitMs > 0) {
+        const det = detectChallengeHtml(html);
+        if (det) {
+          // A memória-diéta (kép/font/tracker-blokk) a challenge szkriptjeit is
+          // fojthatja → a challenge idejére (és az átengedett lapra) feloldjuk.
+          page.__dietOff = true;
+          const dls = [deadlineTs, BraveController._deadlineOf({ deadlineTs: options.challengeDeadlineTs })].filter(x => x > 0);
+          const { info, html: after } = await handleChallenge(page, det, {
+            waitMs: chCfg.waitMs, interactiveWaitMs: chCfg.interactiveWaitMs, pollMs: chCfg.pollMs,
+            deadlineTs: dls.length ? Math.min(...dls) - 300 : 0,
+            solve: chCfg.solve, purpose: 'read',
+            human: this._humanInput(), humanizeIdle: this._humanizeOn(),
+            busy: () => this._scrapeGate._waiters.length > 0, busyWaitMs: chCfg.busyWaitMs,
+          });
+          if (killed) throw BraveController._pageDeadlineError('page');
+          challengeInfo = info;
+          if (after) html = after;
+          else { try { html = await page.content(); } catch (_) { /* a régi html marad */ } }
+          cfStatus = info.passed ? 'cleared_attempt_1' : 'blocked';
+          console.log(`[challenge] ${info.type} host=${hostOnly(url)} passed=${info.passed} waited=${info.waited_ms}ms` +
+            `${info.solve?.clicks ? ` clicks=${info.solve.clicks}` : ''}`);
+          if (info.passed) await this._saveClearance(page, url);
+        }
+      } else if (stealthMode && this._isCloudflareChallenge(html)) {
         cfStatus = 'attempt_1';
         console.log('[CF] Challenge detected, waiting 8s for auto-resolve...');
         // Kis emberi mozgás — Cloudflare behaviour-score-ját lendíti
@@ -1043,8 +1131,16 @@ export class BraveController {
         // cf_status: 'none' | 'cleared_attempt_N' | 'blocked' — kliens-side telemetria
         cf_status: cfStatus,
       };
+      if (challengeInfo) result.challenge = challengeInfo;
       // Content-flag dekorálás — content_usable + block_reason + markdown_warning
-      return this._decorateContentFlags(result);
+      const decorated = this._decorateContentFlags(result);
+      // Át nem jutott challenge: a lap maga a fal (akkor is, ha hosszú) — ne idézze a hívó.
+      if (challengeInfo && !challengeInfo.passed) {
+        decorated.content_usable = false;
+        decorated.block_reason = `challenge:${challengeInfo.final_type || challengeInfo.type}`;
+        decorated.markdown_warning = 'CONTENT_STUB_DO_NOT_QUOTE';
+      }
+      return decorated;
 
     } catch (e) {
       // A saját határidőnk zárta a lapot → egységes, felismerhető hiba (nem
@@ -1930,6 +2026,13 @@ export class BraveController {
     // riasztható legyen. Lustán értékel: a click UTÁNI navigáció is látszik.
     const echo = (o) => ({ ...o, url: page.url() });
 
+    // 2026-10-07 (W2): HUMANIZE=1 → a mozdulatok/kattintások a munkamenet
+    // „kezén" (stealth/humanize.js) mennek, és a lapba SEMMI nem kerül (a régi
+    // út window.mouseX/mouseY-t és egy mousemove-figyelőt injektált — maga is jel).
+    if (this._humanizeOn() && ['move', 'click', 'doubleClick', 'rightClick', 'drag', 'hover'].includes(params.action)) {
+      return echo(await this._mouseControlHuman(page, params));
+    }
+
     // Track mouse position
     await page.evaluateOnNewDocument(() => {
       window.mouseX = 0;
@@ -2271,6 +2374,39 @@ export class BraveController {
     }
   }
 
+  // HUMANIZE=1 út a brave_mouse_control-hoz (lásd mouseControl).
+  async _mouseControlHuman(page, params) {
+    const h = this._humanInput();
+    const x = Number(params.x), y = Number(params.y);
+    const pos = { x: params.x, y: params.y };
+    switch (params.action) {
+      case 'move':
+        await h.move(page, x, y);
+        return { success: true, action: 'move', position: pos, humanized: true };
+      case 'click':
+        await h.click(page, x, y);
+        return { success: true, action: 'click', position: pos, humanized: true };
+      case 'doubleClick':
+        await h.click(page, x, y, { clickCount: 2 });
+        return { success: true, action: 'doubleClick', position: pos, humanized: true };
+      case 'rightClick':
+        await h.click(page, x, y, { button: 'right' });
+        return { success: true, action: 'rightClick', position: pos, humanized: true };
+      case 'hover':
+        await h.move(page, x, y);
+        await this.humanDelay(params.duration || 1000, params.duration || 1500);
+        return { success: true, action: 'hover', position: pos, humanized: true };
+      case 'drag':
+        await h.move(page, x, y);
+        await page.mouse.down();
+        await h.move(page, Number(params.targetX), Number(params.targetY));
+        await page.mouse.up();
+        return { success: true, action: 'drag', from: pos, to: { x: params.targetX, y: params.targetY }, humanized: true };
+      default:
+        return { success: false, error: `unknown action: ${params.action}` };
+    }
+  }
+
   // Emberi egérmozgás szimuláció Bézier görbével
   async humanMouseMove(page, targetX, targetY, duration = 500) {
     const steps = Math.ceil(duration / 20);
@@ -2450,8 +2586,11 @@ export class BraveController {
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       try {
-        if (BraveController.DIET_BLOCKED_TYPES.has(req.resourceType()) ||
-            BraveController.DIET_BLOCKED_HOSTS.some(p => req.url().includes(p))) {
+        // 2026-10-07 (W2): challenge alatt a diéta szünetel (page.__dietOff) —
+        // az interceptiont NEM kapcsoljuk ki (a függő kérések continue()-ja
+        // akkor kezeletlen elutasítással dőlne el).
+        if (!page.__dietOff && (BraveController.DIET_BLOCKED_TYPES.has(req.resourceType()) ||
+            BraveController.DIET_BLOCKED_HOSTS.some(p => req.url().includes(p)))) {
           return req.abort();
         }
         return req.continue();
@@ -2665,6 +2804,20 @@ export class BraveController {
       // 2026-10-07: TF-evasions kapcsoló (indításkor olvasva).
       stealth_tf: TF_EVASIONS ? tfHealth() : { enabled: false },
       stealth_pe: PE_MINIMAL ? peMinimalHealth() : { minimal: false },
+      // 2026-10-07 (W2): challenge-kezelés, emberi bemenet, hálózati/canvas-réteg,
+      // CAPTCHA-megoldó (a kulcsot sosem mutatja, csak hogy aktív-e).
+      challenge: challengeHealth(),
+      humanize: { enabled: humanizeEnabled(), seed_fixed: /^\d+$/.test(String(process.env.HUMANIZE_SEED || '').trim()) },
+      stealth_net: {
+        webrtc: this._egressEnabled ? 'disable_non_proxied_udp (egress)'
+          : (BraveController._webrtcBlockArgs(false).length ? 'disable_non_proxied_udp' : 'native'),
+        // Canvas: Brave alatt a böngésző SAJÁT farblingja (fő szál + worker
+        // egyezően, munkamenetenként új token) — JS-shim nincs (az maga jel).
+        canvas: /brave/i.test(String(this._exePath || process.env.BRAVE_PATH || '')) ? 'brave_farbling' : 'native',
+        // false = a régi --disable-web-security (BRAVE_DISABLE_WEB_SECURITY=1).
+        web_security: !/^(1|true|on|yes)$/i.test(String(process.env.BRAVE_DISABLE_WEB_SECURITY || '').trim()),
+      },
+      captcha_solver: captchaSolverHealth(),
     };
   }
 
@@ -2788,6 +2941,43 @@ export class BraveController {
       );
     } catch (e) {
       console.warn(`[cookie-jar] save failed for host=${hostOnly(url)}: ${redactUrls(e.message)}`);
+    }
+  }
+
+  // ─── Clearance-tár (W2, 2026-10-07) ──────────────────────────────────
+  // Hostonként a védelmi rendszerek ÁTENGEDŐ sütijei (cf_clearance, datadome,
+  // _px*, …) + a megszerzésükkor használt UA. Fájl a .sessions/-ben (mint a
+  // stealth cookie-jar); TTL: CHALLENGE_CLEARANCE_TTL_MS (alap 25 perc).
+  _clearancePath(host) {
+    return path.join(process.cwd(), '.sessions', `_clearance_${String(host).replace(/[^a-z0-9.-]/gi, '_')}.json`);
+  }
+
+  async _loadClearance(url, ttlMs) {
+    try {
+      const host = new URL(url).hostname;
+      const data = JSON.parse(await fs.readFile(this._clearancePath(host), 'utf-8'));
+      if (!data || Date.now() - (data.ts || 0) > ttlMs) return null;
+      const cookies = clearanceCookies(data.cookies);
+      if (!cookies.length) return null;
+      return { ua: typeof data.ua === 'string' && data.ua ? data.ua : null, cookies };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async _saveClearance(page, url) {
+    try {
+      const cookies = clearanceCookies(await page.cookies());
+      if (!cookies.length) return;
+      const ua = await page.evaluate(() => navigator.userAgent).catch(() => null);
+      const hosts = new Set([new URL(url).hostname]);
+      try { hosts.add(new URL(page.url()).hostname); } catch (_) { /* */ }
+      await fs.mkdir(path.join(process.cwd(), '.sessions'), { recursive: true });
+      for (const host of hosts) {
+        await fs.writeFile(this._clearancePath(host), JSON.stringify({ host, ts: Date.now(), ua, cookies }));
+      }
+    } catch (e) {
+      console.warn(`[clearance] mentés sikertelen host=${hostOnly(url)}: ${redactUrls(String(e?.message || e))}`);
     }
   }
 

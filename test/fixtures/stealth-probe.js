@@ -236,6 +236,44 @@ const PROBE_SCRIPT = String.raw`
     add('worker_uad_vs_main', w.br === mainBr && w.up === (uad ? uad.platform : '') ? 'egyezik' : 'WORKER: ' + w.br + ' ' + w.up, !(w.br === mainBr && w.up === (uad ? uad.platform : '')));
   } catch (e) { add('worker_ua_vs_main', 'HIBA: ' + (e && e.message), false); }
 
+  // 17) Canvas (W2, 2026-10-07): stabil-e egy lapon belül, és a worker
+  // (OffscreenCanvas) ugyanazt rajzolja-e, mint a fő szál — egy JS-szintű
+  // canvas-zaj a workerbe nem ér el (ellentmondás = jel). A hash maga csak
+  // tájékoztató (Brave alatt a farbling munkamenetenként más).
+  try {
+    const DRAW = 'function draw(c){const x=c.getContext("2d");x.fillStyle="#f60";x.fillRect(10,10,100,40);x.fillStyle="#069";' +
+      'x.font="16px Arial";x.fillText("Cwm fjordbank glyphs vext quiz",4,30);x.strokeStyle="rgba(102,204,0,0.7)";' +
+      'x.beginPath();x.arc(80,30,22,0,Math.PI*2);x.stroke();return x.getImageData(0,0,c.width,c.height).data;}' +
+      'function fnv(d){let h=2166136261;for(let i=0;i<d.length;i++){h^=d[i];h=Math.imul(h,16777619)>>>0;}return h.toString(16);}';
+    const mainHash = new Function(DRAW + 'return (c)=>fnv(draw(c));')();
+    const c1 = document.createElement('canvas'); c1.width = 220; c1.height = 60;
+    const c2 = document.createElement('canvas'); c2.width = 220; c2.height = 60;
+    const h1 = mainHash(c1), h2 = mainHash(c2);
+    add('canvas_stable', h1 === h2 ? 'stabil' : 'ELTÉR: ' + h1 + ' vs ' + h2, h1 !== h2);
+    add('canvas_hash', h1, false);
+    const wsrc = DRAW + 'const o=new OffscreenCanvas(220,60);postMessage(fnv(draw(o)));';
+    const wk = new Worker(URL.createObjectURL(new Blob([wsrc], { type: 'text/javascript' })));
+    const wh = await new Promise((res, rej) => { wk.onmessage = (e) => res(e.data); wk.onerror = (e) => rej(e); setTimeout(() => rej(new Error('worker timeout')), 3000); });
+    wk.terminate();
+    add('canvas_worker_vs_main', wh === h1 ? 'egyezik' : 'WORKER: ' + wh + ' vs ' + h1, wh !== h1);
+  } catch (e) { add('canvas_worker_vs_main', 'HIBA: ' + (e && e.message), false); }
+
+  // 18) WebRTC (W2): a helyi (nem mDNS-elrejtett) IP kiszivárog-e az ICE-
+  // jelöltekben. STUN nélkül (hálózat nem kell): csak a host-jelöltek.
+  try {
+    const pc = new RTCPeerConnection({ iceServers: [] });
+    const cands = [];
+    pc.onicecandidate = (e) => { if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate); };
+    pc.createDataChannel('x');
+    await pc.setLocalDescription(await pc.createOffer());
+    await new Promise(r => setTimeout(r, 1200));
+    pc.close();
+    const ips = cands.map(c => (c.split(' ')[4] || '')).filter(Boolean);
+    const raw = ips.filter(ip => !/\.local$/i.test(ip));
+    add('webrtc_candidates', ips.length + (raw.length ? ' (nyers: ' + raw.join(',') + ')' : ''), false);
+    add('webrtc_local_ip_leak', raw.length ? raw.join(',') : 'nincs', raw.length > 0);
+  } catch (e) { add('webrtc_local_ip_leak', 'HIBA: ' + (e && e.message), false); }
+
   const bots = Object.keys(R).filter(k => R[k].bot);
   const out = { signals: bots.length, checks: Object.keys(R).length, bots, results: R };
   const pre = document.getElementById('out');
