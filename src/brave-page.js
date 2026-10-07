@@ -26,12 +26,13 @@ import crypto from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { BLOCK_HEADER } from './egress.js';
-import { solveOnReadPath } from './captcha/read-path.js';
-import { fromHumanInput } from './captcha/pointer.js';
 import {
   diagnoseInPage, nextMove, diagnoseSelector, isBadSelectorError, fieldStateInPage, keptVerdict,
   describeInPage, NEXT_MOVE,
 } from './action-diagnose.js';
+// C2 (2026-10-07): a CAPTCHA-megoldó CSAK az egyszeri `purpose:"read"`-es hívásban (lásd run())
+import { solveOnReadPath } from './captcha/read-path.js';
+import { fromHumanInput } from './captcha/pointer.js';
 
 const envInt = (k, d) => {
   const v = parseInt(process.env[k] ?? '', 10);
