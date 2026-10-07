@@ -8,9 +8,14 @@
 //   * saját jeldetektor (test/fixtures/stealth-probe.js, 127.0.0.1),
 //   * nyilvános fingerprint-/botdetektor-oldalak (sannysoft, creepjs,
 //     browserleaks, pixelscan, deviceandbrowserinfo, areyouheadless),
-//   * valós, közepesen védett oldalak — CSAK azt rögzítjük, kapunk-e
-//     blokk-/challenge-lapot. ⛔ CAPTCHA-megoldás / Turnstile-kijátszás NINCS
-//     (Kommandant, 09-23): a mérés a detektálási JELEK számát nézi.
+//   * valós, közepesen védett oldalak — rögzítjük, kapunk-e blokk-/challenge-
+//     lapot, és (W2 óta) a válasz `challenge` mezőjét (típus, átjutott-e, várt
+//     idő, kattintások);
+//   * W2 (2026-10-07): challenge-oldalak (`--sites challenge`) — helyi fixtúrák
+//     (CF interstitial, Turnstile, DataDome) és nyilvános CF/Turnstile-demók.
+//     A 09-23-i „CAPTCHA-megoldás / Turnstile nincs" elvet a Kommandant 10-07-én
+//     VISSZAVONTA (~/recon/tinyfish/DECISIONS.md) — a `on_new` konfig kivár és
+//     (CHALLENGE_SOLVE=1) a checkboxra kattint.
 //
 // Konfigurációk (env a szerverprocesszeknek):
 //   off      — STEALTH_TF_EVASIONS kikapcsolva (a mai éles viselkedés)
@@ -20,6 +25,9 @@
 //   on       — csak STEALTH_TF_EVASIONS=1 (a TF alapértékei = on_host_native)
 //   on_peminimal  — TF + STEALTH_PE_MINIMAL=1 (a pe natívan fölösleges shimjei KI)
 //   off_peminimal — csak STEALTH_PE_MINIMAL=1
+//   (a fentiek mind CHALLENGE_WAIT_MS=0-val = a W2 ELŐTTI viselkedés)
+//   on_wait  — on_peminimal + challenge-kivárás (W2, alapértékek), kattintás nélkül
+//   on_new   — on_peminimal + kivárás + CHALLENGE_SOLVE=1 + HUMANIZE=1 (W2 teljes)
 //
 // Használat:
 //   node scripts/stealth-ab.mjs --browser /usr/bin/brave-browser \
@@ -35,6 +43,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startFixture } from '../test/helpers.js';
 import { probeRoutes, parseProbe } from '../test/fixtures/stealth-probe.js';
+import { challengeRoutes } from '../test/fixtures/challenge-pages.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -43,16 +52,23 @@ function arg(name, def) {
   return i > 0 && process.argv[i + 1] ? process.argv[i + 1] : def;
 }
 
+// A W2 előtti konfigok a challenge-kezelés NÉLKÜL és a régi --disable-web-security-vel
+// (= a korábbi mérések viselkedése).
+const PRE_W2 = { CHALLENGE_WAIT_MS: '0', BRAVE_DISABLE_WEB_SECURITY: '1' };
 const CONFIGS = {
-  off: {},
-  on_ua: { STEALTH_TF_EVASIONS: '1', STEALTH_TF_PERSONA_OS: 'ua', STEALTH_TF_WEBGL: 'mask' },
-  on_host: { STEALTH_TF_EVASIONS: '1', STEALTH_TF_PERSONA_OS: 'host', STEALTH_TF_WEBGL: 'mask' },
-  on_host_native: { STEALTH_TF_EVASIONS: '1', STEALTH_TF_PERSONA_OS: 'host', STEALTH_TF_WEBGL: 'native' },
+  off: { ...PRE_W2 },
+  on_ua: { ...PRE_W2, STEALTH_TF_EVASIONS: '1', STEALTH_TF_PERSONA_OS: 'ua', STEALTH_TF_WEBGL: 'mask' },
+  on_host: { ...PRE_W2, STEALTH_TF_EVASIONS: '1', STEALTH_TF_PERSONA_OS: 'host', STEALTH_TF_WEBGL: 'mask' },
+  on_host_native: { ...PRE_W2, STEALTH_TF_EVASIONS: '1', STEALTH_TF_PERSONA_OS: 'host', STEALTH_TF_WEBGL: 'native' },
   // A TF alapértékei (= on_host_native, 2026-10-07 óta) — élesítés előtti ellenőrzéshez.
-  on: { STEALTH_TF_EVASIONS: '1' },
+  on: { ...PRE_W2, STEALTH_TF_EVASIONS: '1' },
   // R2-E (P1-3): „pe-minimál" — a puppeteer-extra natívan fölösleges shimjei KI.
-  on_peminimal: { STEALTH_TF_EVASIONS: '1', STEALTH_PE_MINIMAL: '1' },
-  off_peminimal: { STEALTH_PE_MINIMAL: '1' },
+  on_peminimal: { ...PRE_W2, STEALTH_TF_EVASIONS: '1', STEALTH_PE_MINIMAL: '1' },
+  off_peminimal: { ...PRE_W2, STEALTH_PE_MINIMAL: '1' },
+  // W2 (2026-10-07): challenge-kivárás (alapértékek) — kattintás nélkül.
+  on_wait: { STEALTH_TF_EVASIONS: '1', STEALTH_PE_MINIMAL: '1' },
+  // W2 teljes: kivárás + Turnstile/checkbox-kattintás + emberi bemenet.
+  on_new: { STEALTH_TF_EVASIONS: '1', STEALTH_PE_MINIMAL: '1', CHALLENGE_SOLVE: '1', HUMANIZE: '1' },
 };
 
 // ─── Elemzők: szöveg → { signals, verdict, details[] } ───────────────────
@@ -138,9 +154,20 @@ const PARSERS = {
   real(text, r) {
     const t = String(text || '');
     const title = String(r?.title || '');
-    const blocked = t.trim().length < 200 || BLOCK_RE.test(title) || BLOCK_RE.test(t.slice(0, 3000));
-    const why = t.trim().length < 200 ? 'üres/csonk válasz' : ((title.match(BLOCK_RE) || t.slice(0, 3000).match(BLOCK_RE) || [])[0] || '');
-    return { signals: blocked ? 1 : 0, verdict: blocked ? `BLOKK (${why})` : `átjut (${t.length} kar.)`, details: blocked ? [why] : [] };
+    const ch = r?.challenge;
+    const chFail = !!(ch && !ch.passed);
+    const blocked = chFail || t.trim().length < 200 || BLOCK_RE.test(title) || BLOCK_RE.test(t.slice(0, 3000));
+    const why = chFail ? `challenge ${ch.final_type || ch.type}` : t.trim().length < 200 ? 'üres/csonk válasz'
+      : ((title.match(BLOCK_RE) || t.slice(0, 3000).match(BLOCK_RE) || [])[0] || '');
+    const chTxt = ch ? ` · ${ch.type} ${ch.passed ? 'ÁT' : 'nem'} ${ch.waited_ms}ms${ch.solve?.clicks ? ` ${ch.solve.clicks} katt.` : ''}` : '';
+    return { signals: blocked ? 1 : 0, verdict: (blocked ? `BLOKK (${why})` : `átjut (${t.length} kar.)`) + chTxt, details: blocked ? [why] : [] };
+  },
+  // Helyi challenge-fixtúra: átjutott-e a cikkig.
+  fixture(text, r) {
+    const ok = /ARTICLE-CONTENT-OK/.test(String(text || ''));
+    const ch = r?.challenge;
+    const chTxt = ch ? ` · ${ch.type} ${ch.waited_ms}ms${ch.solve?.clicks ? ` ${ch.solve.clicks} katt.` : ''}` : ' · nincs challenge-kezelés';
+    return { signals: ok ? 0 : 1, verdict: (ok ? 'ÁT' : 'BLOKK') + chTxt, details: ok ? [] : ['nem jutott át'] };
   },
 };
 
@@ -164,6 +191,17 @@ const REAL = [
   { id: 'idealista', url: 'https://www.idealista.com/' },
   { id: 'g2', url: 'https://www.g2.com/categories/crm' },
 ].map(s => ({ ...s, kind: 'real', wait: 3000 }));
+// W2: challenge-oldalak — helyi fixtúrák (determinisztikus) + nyilvános demók.
+const CHALLENGE = [
+  { id: 'fx_cf', path: '/cf?d=3000', kind: 'fixture', wait: 0 },
+  { id: 'fx_ts', path: '/ts', kind: 'fixture', wait: 0 },
+  { id: 'fx_dd', path: '/dd?d=2000', kind: 'fixture', wait: 0 },
+  { id: 'nowsecure', url: 'https://nowsecure.nl/', kind: 'real', wait: 1000 },
+  { id: 'scrapingcourse_cf', url: 'https://www.scrapingcourse.com/cloudflare-challenge', kind: 'real', wait: 1000 },
+  { id: 'nopecha_cf', url: 'https://nopecha.com/demo/cloudflare', kind: 'real', wait: 1000 },
+  { id: 'sb_turnstile', url: 'https://seleniumbase.io/apps/turnstile', kind: 'real', wait: 1000 },
+  { id: 'ahrefs_cf', url: 'https://ahrefs.com/website-authority-checker', kind: 'real', wait: 1000 },
+].map(s => ({ ...s, group: 'challenge' }));
 
 // ─── Szerver-indítás (mint a test/http-e2e.test.js) ─────────────────────
 async function freePort() {
@@ -230,25 +268,30 @@ async function main() {
   const outPath = arg('out', path.join(os.tmpdir(), 'stealth-ab.json'));
   const mdPath = arg('md', '');
 
-  const fx = await startFixture(probeRoutes());
+  const fx = await startFixture({ ...probeRoutes(), ...challengeRoutes() });
   const servers = {};
   for (const c of cfgNames) servers[c] = await startServer(c, CONFIGS[c], browserPath);
   const meta = { started: new Date().toISOString(), browser: browserPath, configs: {} };
   for (const c of cfgNames) {
     const h = await servers[c].health();
-    meta.configs[c] = { env: CONFIGS[c], stealth_tf: h?.stealth_tf ?? null, stealth_pe: h?.stealth_pe ?? null };
+    meta.configs[c] = { env: CONFIGS[c], stealth_tf: h?.stealth_tf ?? null, stealth_pe: h?.stealth_pe ?? null,
+      challenge: h?.challenge ?? null, humanize: h?.humanize ?? null, stealth_net: h?.stealth_net ?? null };
   }
 
   const jobs = [];
   for (const s of PUBLIC) jobs.push({ ...s, round: 1 });
   for (let r = 1; r <= realRounds; r++) for (const s of REAL) jobs.push({ ...s, round: r });
+  const chRounds = parseInt(arg('challenge-rounds', '1'), 10);
+  for (let r = 1; r <= chRounds; r++) for (const s of CHALLENGE) jobs.push({ ...s, round: r });
   const results = [];
   const save = () => fs.writeFileSync(outPath, JSON.stringify({ meta, results }, null, 1));
 
   const siteIdx = {};
   const seen = {};
   for (const job of jobs) {
-    if (only && !only.has(job.id) && !(only.has('real') && job.kind === 'real')) continue;
+    if (only && !only.has(job.id) && !(only.has('real') && job.kind === 'real' && !job.group) &&
+        !(only.has('challenge') && job.group === 'challenge')) continue;
+    if (!only && job.group === 'challenge' && !process.argv.includes('--with-challenge')) continue;
     // Konfig-sorrend forgatása oldalanként ÉS körönként (IP-hírnév / sorrendi
     // torzítás ellen): egy oldal k-adik előfordulásánál a (oldal-index + k)-adik
     // konfig megy elöl — így N körben minden konfig egyszer első. (A globális
@@ -260,7 +303,7 @@ async function main() {
     const order = cfgNames.map((_, i) => cfgNames[(i + off) % cfgNames.length]);
     for (const c of order) {
       for (const level of ['default', 'stealth']) {
-        const url = job.kind === 'probe' ? `${fx.base}/probe` : job.url;
+        const url = job.kind === 'probe' ? `${fx.base}/probe` : job.path ? `${fx.base}${job.path}` : job.url;
         const t0 = Date.now();
         let r;
         try { r = await servers[c].call({ url, stealth: level === 'stealth', waitTime: job.wait, timeout: 45000 }); } catch (e) { r = { error: e.message }; }
@@ -268,7 +311,9 @@ async function main() {
         const text = r?.text || r?.raw || '';
         const parsed = r?.error ? { signals: null, verdict: 'HIBA: ' + String(r.error).slice(0, 80), details: [] } : PARSERS[job.kind](text, r);
         const ua = (text.match(/Mozilla\/5\.0 \(([^)]+)\)/) || [])[1] || '';
-        results.push({ site: job.id, kind: job.kind, round: job.round, config: c, level, ms, ...parsed, ua_os: ua ? uaOS(ua) : '' });
+        const ch = r?.challenge ? { type: r.challenge.type, passed: r.challenge.passed, waited_ms: r.challenge.waited_ms,
+          clicks: r.challenge.solve?.clicks || 0, final_type: r.challenge.final_type } : null;
+        results.push({ site: job.id, kind: job.kind, round: job.round, config: c, level, ms, ...parsed, ua_os: ua ? uaOS(ua) : '', challenge: ch });
         console.log(`[ab] ${job.id}#${job.round} ${c}/${level} ${ms}ms → ${parsed.signals ?? '–'} | ${parsed.verdict}${parsed.details.length ? ' | ' + parsed.details.slice(0, 6).join(',') : ''}`);
         save();
       }
@@ -290,7 +335,11 @@ export function renderMd({ meta, results }) {
     if (!rs.length) return '–';
     const nums = rs.map(r => r.signals).filter(v => v !== null && v !== undefined);
     if (!nums.length) return rs[0].verdict;
-    if (rs[0].kind === 'real') return `${nums.reduce((a, b) => a + b, 0)}/${nums.length} blokk`;
+    if (rs[0].kind === 'real' || rs[0].kind === 'fixture') {
+      const chs = rs.filter(r => r.challenge);
+      const chTxt = chs.length ? ` (ch: ${chs.map(r => `${r.challenge.type.replace(/^cloudflare_/, 'cf_')}${r.challenge.passed ? '✓' : '✗'}${r.challenge.clicks ? '·' + r.challenge.clicks + 'k' : ''}`).join(',')})` : '';
+      return `${nums.reduce((a, b) => a + b, 0)}/${nums.length} blokk${chTxt}`;
+    }
     return `${nums.join('+')} · ${rs[0].verdict}`;
   };
   const head = ['Oldal', ...cfgs.flatMap(c => [`${c} default`, `${c} stealth`])];

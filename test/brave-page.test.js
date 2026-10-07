@@ -325,7 +325,11 @@ test('egress teszt-módban is: belső háló tiltva (fő URL, redirect, al-erőf
   assert.match(r4.blocked.reason, /169\.254\.169\.254/);
 
   const r5 = await run({ url: `${fx.base}/page2`, actions: [{ type: 'executeJavascript', script: 'return fetch("http://192.168.1.1/").then(r => r.status + ":" + r.headers.get("x-brave-egress-blocked"), e => "ERR")' }] });
-  assert.match(String(r5.action_results[0].js_result), /^403:blocked_ip:192\.168\.1\.1$/);
+  // 2026-10-07 (W2): a böngésző alapból MÁR NEM --disable-web-security-vel fut →
+  // a lap egy idegen origin válaszát (a proxy 403-ját sem) olvashatja: a fetch
+  // CORS-/helyi-hálózat-hibával dől el ('ERR'). Mindkét kimenet tiltás; a régi
+  // alak a BRAVE_DISABLE_WEB_SECURITY=1 mellett marad.
+  assert.match(String(r5.action_results[0].js_result), /^(403:blocked_ip:192\.168\.1\.1|ERR)$/);
 });
 
 test('séma-őr: file:/data:/chrome:/javascript: tiltva — URL-ként, navigate-ként és lapon belül', { skip }, async () => {

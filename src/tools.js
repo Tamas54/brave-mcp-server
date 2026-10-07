@@ -1,4 +1,4 @@
-import { crawlBudgetMs } from './tool-timeout.js';
+import { crawlBudgetMs, toolTimeoutMs } from './tool-timeout.js';
 
 // 2026-10-07 (R2-E, P3-2 MCP-higiénia): minden tool `title` + `annotations`
 // (readOnlyHint / destructiveHint / idempotentHint / openWorldHint — MCP
@@ -58,7 +58,7 @@ export const tools = [
     name: 'brave_scrape',
     title: 'Weblap kiolvasása',
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    description: 'Weboldal tartalmának scrape-elése. Default: gyors Puppeteer-Stealth. Az `auto_fallback: true` kapcsolóval a server automatikusan eszkalál (stealth → Webclaw TLS-impersonáció → FlareSolverr → FlareSolverr+render → Wayback → AMP) anti-bot védelem alapján — egy hívás, transzparens 7-szintű chain, `escalation_path` visszacsatolás.',
+    description: 'Weboldal tartalmának scrape-elése. Default: gyors Puppeteer-Stealth. JS-challenge (Cloudflare, DataDome, PerimeterX) esetén a server kivárja az átengedést; a válasz `challenge` mezője: {type, waited_ms, passed}. Az `auto_fallback: true` kapcsolóval a server automatikusan eszkalál (stealth → Webclaw TLS-impersonáció → FlareSolverr → FlareSolverr+render → Wayback → AMP) anti-bot védelem alapján — egy hívás, transzparens 7-szintű chain, `escalation_path` visszacsatolás.',
     handler: 'tools/call',
     inputSchema: {
       type: 'object',
@@ -103,7 +103,10 @@ export const tools = [
       required: ['url']
     },
     execute: async (controller, params) => {
-      return await controller.scrape(params.url, params);
+      // 2026-10-07 (W2): a challenge-kivárás a hívás-határidőn BELÜL marad
+      // (különben a 25 s-os keret 504-gyel dobná el a már átjutott lapot).
+      const challengeDeadlineTs = Date.now() + toolTimeoutMs('brave_scrape', params) - 3000;
+      return await controller.scrape(params.url, { ...params, challengeDeadlineTs });
     }
   },
 

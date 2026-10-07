@@ -26,6 +26,10 @@ import crypto from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { BLOCK_HEADER } from './egress.js';
+// 2026-10-07 (W2): HUMANIZE=1 → kattintás/gépelés a munkamenet „kezén" (egérpálya,
+// gombnyomás-dwell, gépelési ritmus). CAPTCHA-megoldó / challenge-kattintás ITT
+// SOHA (koordinátori határ: a megoldó csak olvasási úton fut).
+import { humanizeEnabled } from './stealth/humanize.js';
 import {
   diagnoseInPage, nextMove, diagnoseSelector, isBadSelectorError, fieldStateInPage, keptVerdict,
   describeInPage, NEXT_MOVE,
@@ -780,6 +784,10 @@ export class PageSessionManager {
     if (why) delete why.point;
     if (d && (d.covered_by || d.disabled)) return { ok: false, why };
     if (d && d.point) {
+      if (humanizeEnabled() && this.c?._humanInput) {
+        await this.c._humanInput().click(page, d.point.x, d.point.y, { targetW: Math.min(d.width || 0, d.height || 0) || null });
+        return { ok: true, mode: 'mouse', humanized: true };
+      }
       await page.mouse.click(d.point.x, d.point.y);
       return { ok: true, mode: 'mouse' };
     }
@@ -997,7 +1005,8 @@ export class PageSessionManager {
             const hit = h.asElement();
             if (hit) { r.target = await hit.evaluate(describeInPage); await hit.dispose(); } else await h.dispose();
           } catch (_) { /* a lap közben cserélődött */ }
-          await this._settleAfterInput(s, () => page.mouse.click(x, y), deadline, reserveMs, warn);
+          const human = humanizeEnabled() && this.c?._humanInput ? this.c._humanInput() : null;
+          await this._settleAfterInput(s, () => (human ? human.click(page, x, y) : page.mouse.click(x, y)), deadline, reserveMs, warn);
           r.clicked = 1;
         } else {
           r.error = 'click requires selector, text or x/y';
@@ -1022,7 +1031,14 @@ export class PageSessionManager {
         }
         const before = await this._fieldState(el);
         if (text.length <= 1000) {
-          await bounded(page.keyboard.type(text), Math.max(200, rem()), 'write');
+          let typed = false;
+          if (humanizeEnabled() && this.c?._humanInput) {
+            // Emberi ritmus a hívás keretén belül (ha nem fér bele: a gyors út, kimondva).
+            const hr = await bounded(this.c._humanInput().type(page, text, { budgetMs: Math.max(0, rem() - 1500) }), Math.max(200, rem()), 'write');
+            if (hr?.humanized) typed = true;
+            else warn('humanize_typing_skipped: budget');
+          }
+          if (!typed) await bounded(page.keyboard.type(text), Math.max(200, rem()), 'write');
         } else {
           // Hosszú szöveg: egy lépésben (Input.insertText), karakterenként lassú lenne.
           await bounded(page.keyboard.sendCharacter(text), Math.max(200, rem()), 'write');
