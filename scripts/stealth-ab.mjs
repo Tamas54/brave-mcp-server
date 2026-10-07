@@ -18,6 +18,8 @@
 //   on_host  — TF, persona-OS = gazdagép + WebGL-maszk
 //   on_host_native — TF, persona-OS = gazdagép, nincs WebGL-maszk
 //   on       — csak STEALTH_TF_EVASIONS=1 (a TF alapértékei = on_host_native)
+//   on_peminimal  — TF + STEALTH_PE_MINIMAL=1 (a pe natívan fölösleges shimjei KI)
+//   off_peminimal — csak STEALTH_PE_MINIMAL=1
 //
 // Használat:
 //   node scripts/stealth-ab.mjs --browser /usr/bin/brave-browser \
@@ -48,6 +50,9 @@ const CONFIGS = {
   on_host_native: { STEALTH_TF_EVASIONS: '1', STEALTH_TF_PERSONA_OS: 'host', STEALTH_TF_WEBGL: 'native' },
   // A TF alapértékei (= on_host_native, 2026-10-07 óta) — élesítés előtti ellenőrzéshez.
   on: { STEALTH_TF_EVASIONS: '1' },
+  // R2-E (P1-3): „pe-minimál" — a puppeteer-extra natívan fölösleges shimjei KI.
+  on_peminimal: { STEALTH_TF_EVASIONS: '1', STEALTH_PE_MINIMAL: '1' },
+  off_peminimal: { STEALTH_PE_MINIMAL: '1' },
 };
 
 // ─── Elemzők: szöveg → { signals, verdict, details[] } ───────────────────
@@ -174,7 +179,7 @@ async function startServer(name, extraEnv, browserPath) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `bmcp-ab-${name}-`));
   const env = { ...process.env };
   for (const k of Object.keys(env)) {
-    if (k.startsWith('RAILWAY_') || k.startsWith('BRAVE_') || k.startsWith('STEALTH_TF_')) delete env[k];
+    if (k.startsWith('RAILWAY_') || k.startsWith('BRAVE_') || k.startsWith('STEALTH_TF_') || k.startsWith('STEALTH_PE_')) delete env[k];
   }
   Object.assign(env, {
     PORT: String(port), HEADLESS: 'true', BRAVE_PATH: browserPath,
@@ -229,7 +234,10 @@ async function main() {
   const servers = {};
   for (const c of cfgNames) servers[c] = await startServer(c, CONFIGS[c], browserPath);
   const meta = { started: new Date().toISOString(), browser: browserPath, configs: {} };
-  for (const c of cfgNames) meta.configs[c] = { env: CONFIGS[c], stealth_tf: (await servers[c].health())?.stealth_tf ?? null };
+  for (const c of cfgNames) {
+    const h = await servers[c].health();
+    meta.configs[c] = { env: CONFIGS[c], stealth_tf: h?.stealth_tf ?? null, stealth_pe: h?.stealth_pe ?? null };
+  }
 
   const jobs = [];
   for (const s of PUBLIC) jobs.push({ ...s, round: 1 });

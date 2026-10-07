@@ -17,6 +17,7 @@ import { PageSessionManager } from './brave-page.js';
 import {
   tfEvasionsEnabled, tfEvasionsPlugin, pruneSupersededEvasions, applyTfPersona, tfHealth,
 } from './stealth/tf-evasions/index.js';
+import { peMinimalEnabled, prunePeMinimal, peMinimalHealth } from './stealth/pe-minimal.js';
 
 const execFileP = promisify(execFile);
 
@@ -37,9 +38,14 @@ const puppeteer = addExtra(rebrowserPuppeteer);
 // váltja a puppeteer-extra 4 ellentmondó evasionjét. Alapból KI: ilyenkor a
 // pluginlánc bitre a régi. Indításkor olvasott kapcsoló (lásd src/stealth/tf-evasions/).
 const TF_EVASIONS = tfEvasionsEnabled();
+// 2026-10-07 (R2-E, P1-3): STEALTH_PE_MINIMAL=1 → a puppeteer-extra shimjei
+// közül KI, amit new headless alatt a natív érték már jól ad (Proxy-jelek
+// nélkül). Alapból KI: a lánc bitre a régi. Lásd src/stealth/pe-minimal.js.
+const PE_MINIMAL = peMinimalEnabled();
 {
   const stealth = StealthPlugin();
   if (TF_EVASIONS) pruneSupersededEvasions(stealth);
+  if (PE_MINIMAL) prunePeMinimal(stealth);
   puppeteer.use(stealth);
   if (TF_EVASIONS) puppeteer.use(tfEvasionsPlugin());
 }
@@ -485,27 +491,76 @@ export class BraveController {
     // méret szerint csökkenő (nagy thumbnailek elöl), majd limit
     elements.sort((a, b) => b.area - a.area);
     elements = elements.slice(0, max);
-    // jelölők kirajzolása
-    await page.evaluate((els) => {
-      els.forEach((e, i) => {
-        const m = document.createElement('div');
-        m.className = 'som-marker';
-        m.style.cssText = `position:fixed;left:${e.x - 16}px;top:${e.y - 13}px;` +
-          `min-width:26px;height:24px;padding:0 4px;background:#ff0033;color:#fff;` +
-          `border:2px solid #fff;border-radius:6px;display:flex;align-items:center;` +
-          `justify-content:center;font:bold 15px sans-serif;z-index:2147483647;` +
-          `pointer-events:none;box-shadow:0 0 5px #000;`;
-        m.textContent = (i + 1);
-        document.body.appendChild(m);
-      });
-    }, elements);
-    const screenshot = await page.screenshot({ encoding: 'base64' });
-    await page.evaluate(() => document.querySelectorAll('.som-marker').forEach(e => e.remove()));
-    return {
+    // P3-4 (R2-E, 2026-10-07): a jelölők ALAPBÓL a KÉPRE kerülnek, nem a lap
+    // DOM-jába. MIÉRT: a régi út <div>-eket fűzött a lapba (majd levette) — egy
+    // MutationObserver-es lap ezt látja (mérve: invisible_playwright_mcp
+    // REPORT, M3), és a lap saját JS-e reagálhat rá. Most: a lapról tiszta
+    // képernyőkép, a jelölőket egy KÜLÖN, izolált segédlapon rajzoljuk a kép
+    // fölé, és arról készül a jelölt kép (képlib nélkül). A régi DOM-jelölő
+    // opt-in: dom_markers=true.
+    const domMarkers = options.dom_markers === true || options.domMarkers === true;
+    const markerCss = (e) => `position:fixed;left:${e.x - 16}px;top:${e.y - 13}px;` +
+      `min-width:26px;height:24px;padding:0 4px;background:#ff0033;color:#fff;` +
+      `border:2px solid #fff;border-radius:6px;display:flex;align-items:center;` +
+      `justify-content:center;font:bold 15px sans-serif;z-index:2147483647;` +
+      `pointer-events:none;box-shadow:0 0 5px #000;box-sizing:content-box;`;
+    let screenshot;
+    let markers = domMarkers ? 'dom' : 'image';
+    const warnings = [];
+    if (domMarkers) {
+      await page.evaluate((els, css) => {
+        els.forEach((e, i) => {
+          const m = document.createElement('div');
+          m.className = 'som-marker';
+          m.style.cssText = css[i];
+          m.textContent = (i + 1);
+          document.body.appendChild(m);
+        });
+      }, elements, elements.map(markerCss));
+      screenshot = await page.screenshot({ encoding: 'base64' });
+      await page.evaluate(() => document.querySelectorAll('.som-marker').forEach(e => e.remove()));
+    } else {
+      const raw = await page.screenshot({ encoding: 'base64' });
+      try {
+        const vp = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+        screenshot = await this._drawMarkersOnImage(raw, vp, elements.map(markerCss));
+      } catch (e) {
+        // A jelölt kép nem készült el: a TISZTA kép + a térkép (a koordináták
+        // érvényesek) — kimondva, nem némán.
+        screenshot = raw;
+        markers = 'none';
+        warnings.push(`markers_not_drawn: ${String(e?.message || e).slice(0, 80)}`);
+      }
+    }
+    const out = {
       screenshot: `data:image/png;base64,${screenshot}`,
       elements: elements.map((e, i) => ({ n: i + 1, label: e.label, href: e.href, x: e.x, y: e.y })),
-      count: elements.length
+      count: elements.length,
+      markers,
     };
+    if (warnings.length) out.warnings = warnings;
+    return out;
+  }
+
+  // A jelölők a KÉPRE: egy izolált (inkognitó) segédlapon a képernyőkép fölé
+  // rajzolt számok, majd erről készül a PNG. A céllaphoz NEM nyúl.
+  async _drawMarkersOnImage(b64png, vp, cssList) {
+    const ctx = this.browser.createBrowserContext
+      ? await this.browser.createBrowserContext()
+      : await this.browser.createIncognitoBrowserContext();
+    try {
+      const p = await ctx.newPage();
+      const w = Math.max(1, Math.round(vp.w)), h = Math.max(1, Math.round(vp.h));
+      await p.setViewport({ width: w, height: h, deviceScaleFactor: 1 });
+      const marks = cssList.map((css, i) => `<div style="${css}">${i + 1}</div>`).join('');
+      await p.setContent(`<!doctype html><html><body style="margin:0;overflow:hidden">` +
+        `<img id="shot" style="position:fixed;left:0;top:0;width:${w}px;height:${h}px" src="data:image/png;base64,${b64png}">` +
+        `${marks}</body></html>`, { waitUntil: 'load', timeout: 10000 });
+      await p.waitForFunction(() => { const i = document.getElementById('shot'); return i && i.complete && i.naturalWidth > 0; }, { timeout: 5000 });
+      return await p.screenshot({ encoding: 'base64' });
+    } finally {
+      await ctx.close().catch(() => {});
+    }
   }
 
   detectBravePath() {
@@ -2609,6 +2664,7 @@ export class BraveController {
       page_sessions: this._pageMgr ? this._pageMgr.health() : { sessions: 0 },
       // 2026-10-07: TF-evasions kapcsoló (indításkor olvasva).
       stealth_tf: TF_EVASIONS ? tfHealth() : { enabled: false },
+      stealth_pe: PE_MINIMAL ? peMinimalHealth() : { minimal: false },
     };
   }
 

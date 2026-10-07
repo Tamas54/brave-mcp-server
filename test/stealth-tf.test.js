@@ -165,10 +165,19 @@ test('vendorolt fork-fájlok: bájtra azonosak a forrással, a 3 visszalépés N
   for (const [f, h] of Object.entries(expected)) {
     assert.equal(createHash('sha256').update(vendorBody(f)).digest('hex'), h, f);
   }
-  const notices = fs.readFileSync(path.join(ROOT, 'THIRD_PARTY_NOTICES.md'), 'utf8');
-  for (const h of Object.values(expected)) assert.ok(notices.includes(h), `a NOTICES-ból hiányzik: ${h}`);
-  for (const c of ['b1206e7ed847bf02d3aa895c3e09da02db4fd3bd', '43f7433057906945b1648179304d7dbd8eb10874', 'Copyright (c) 2020 ASAS1314', 'Copyright (c) 2019 berstend']) {
-    assert.ok(notices.includes(c), `a NOTICES-ból hiányzik: ${c}`);
+  // 2026-10-07: a THIRD_PARTY_NOTICES a repóból KIKERÜLT (Kommandant; helyben,
+  // .gitignore) — a repó-gyökérben vagy a helyi recon-másolatban keressük; ha
+  // egyik sincs (pl. friss worktree / CI), a NOTICES-rész kimarad (a vendorolt
+  // fájlok bájt-ellenőrzése fent így is fut).
+  const noticeCands = [path.join(ROOT, 'THIRD_PARTY_NOTICES.md'),
+    path.join(os.homedir(), 'recon', 'tinyfish', 'THIRD_PARTY_NOTICES_bravemcp.md')];
+  const noticesPath = noticeCands.find(p => fs.existsSync(p));
+  if (noticesPath) {
+    const notices = fs.readFileSync(noticesPath, 'utf8');
+    for (const h of Object.values(expected)) assert.ok(notices.includes(h), `a NOTICES-ból hiányzik: ${h}`);
+    for (const c of ['b1206e7ed847bf02d3aa895c3e09da02db4fd3bd', '43f7433057906945b1648179304d7dbd8eb10874', 'Copyright (c) 2020 ASAS1314', 'Copyright (c) 2019 berstend']) {
+      assert.ok(notices.includes(c), `a NOTICES-ból hiányzik: ${c}`);
+    }
   }
   const script = buildPageScript();
   assert.ok(!/delete Object\.getPrototypeOf\(navigator\)\.webdriver/.test(script), 'webdriver-delete visszalépés');

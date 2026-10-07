@@ -128,7 +128,9 @@ test('HTTP e2e — szigorú egress + napló-redakció', { skip, timeout: 180000 
       }],
     });
     assert.equal(pub.ok, true, pub.error);
-    assert.match(pub.text, /Example Domain/);
+    // 2026-10: az example.com szövege megváltozott (a címsor helyett többnyelvű
+    // bekezdés) — mindkét alakot elfogadjuk.
+    assert.match(pub.text, /Example Domain|documentation examples/);
     for (const v of pub.action_results[0].js_result) assert.match(v, /^403:blocked_ip:127\.0\.0\.1$/);
   }
 

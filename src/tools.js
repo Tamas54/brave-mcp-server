@@ -1,8 +1,26 @@
 import { crawlBudgetMs } from './tool-timeout.js';
 
+// 2026-10-07 (R2-E, P3-2 MCP-higiénia): minden tool `title` + `annotations`
+// (readOnlyHint / destructiveHint / idempotentHint / openWorldHint — MCP
+// 2025-03-26). A kliens ebből dönt pl. megerősítésről; a régi kliens figyelmen
+// kívül hagyja. Kapuk: test/tools-hygiene.test.js (leírás ≤ 1024 karakter,
+// a teljes tools/list token-súlya ≤ a mért érték + 10 %).
+//
+// A tools/list EGY alakja (a http-server minden útja ezt adja).
+export function toolListEntry(tool) {
+  const o = { name: tool.name };
+  if (tool.title) o.title = tool.title;
+  o.description = tool.description;
+  o.inputSchema = tool.inputSchema;
+  if (tool.annotations) o.annotations = { title: tool.title, ...tool.annotations };
+  return o;
+}
+
 export const tools = [
   {
     name: 'brave_navigate',
+    title: 'Látható lap: URL megnyitása',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     description: 'Megnyit egy URL-t a LÁTHATÓ, perzisztens böngészőlapon és nyitva hagyja, majd visszaad egy képernyőképet. Ezután a brave_visual_inspect és brave_mouse_control UGYANAZON az oldalon dolgozik. Interaktív böngészéshez (kattintás, videó-lejátszás) EZT használd, ne a brave_scrape-et.',
     handler: 'tools/call',
     inputSchema: {
@@ -20,12 +38,15 @@ export const tools = [
 
   {
     name: 'brave_marked_snapshot',
-    description: 'Számozott jelölőket (①②③…) rajzol a perzisztens lap kattintható elemeire, és visszaadja a {n, label, x, y} térképet + a jelölt képernyőképet. Set-of-marks: a kattintáshoz elég a SZÁMOT választani, nem kell pixel-koordinátát becsülni.',
+    title: 'Látható lap: számozott elemtérkép',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    description: 'Számozott jelölőket (①②③…) tesz a perzisztens lap kattintható elemeire, és visszaadja a {n, label, x, y} térképet + a jelölt képernyőképet. Set-of-marks: a kattintáshoz elég a SZÁMOT választani, nem kell pixel-koordinátát becsülni. A jelölők a KÉPRE kerülnek (a lap DOM-ja érintetlen); dom_markers=true a régi, lapba rajzolt jelölő.',
     handler: 'tools/call',
     inputSchema: {
       type: 'object',
       properties: {
-        max: { type: 'number', description: 'Max jelölt elem (default 30)' }
+        max: { type: 'number', description: 'Max jelölt elem (default 30)' },
+        dom_markers: { type: 'boolean', description: 'A jelölőket a lap DOM-jába rajzolja (régi mód; a lap látja). Default false.' }
       }
     },
     execute: async (controller, params) => {
@@ -35,6 +56,8 @@ export const tools = [
 
   {
     name: 'brave_scrape',
+    title: 'Weblap kiolvasása',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     description: 'Weboldal tartalmának scrape-elése. Default: gyors Puppeteer-Stealth. Az `auto_fallback: true` kapcsolóval a server automatikusan eszkalál (stealth → Webclaw TLS-impersonáció → FlareSolverr → FlareSolverr+render → Wayback → AMP) anti-bot védelem alapján — egy hívás, transzparens 7-szintű chain, `escalation_path` visszacsatolás.',
     handler: 'tools/call',
     inputSchema: {
@@ -86,6 +109,8 @@ export const tools = [
 
   {
     name: 'brave_crawl',
+    title: 'Webhely bejárása',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     description: 'Weboldal crawl-olása (több oldal bejárása, azonos domainen). Időkeretes: a hívás-határidőn (alapból ~25 s) belül MINDIG visszatér azzal, amit addig begyűjtött — ha nem fért bele minden oldal, truncated=true, stop_reason="time_budget", pending_urls = a be nem járt sor hossza. Oldalanként saját timeout; a hibás/lassú oldalak az errors listába kerülnek, a crawl megy tovább.',
     handler: 'tools/call',
     inputSchema: {
@@ -132,6 +157,8 @@ export const tools = [
 
   {
     name: 'brave_search',
+    title: 'Keresés',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     description: 'Keresés a Brave search-ben',
     handler: 'tools/call',
     inputSchema: {
@@ -155,6 +182,8 @@ export const tools = [
 
   {
     name: 'brave_login',
+    title: 'Bejelentkezés egy webhelyre',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     description: 'Bejelentkezés weboldalakra (Gmail, Facebook, Twitter, stb.)',
     handler: 'tools/call',
     inputSchema: {
@@ -202,6 +231,8 @@ export const tools = [
 
   {
     name: 'brave_session_action',
+    title: 'Művelet bejelentkezett munkamenettel',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     description: 'Művelet végrehajtása bejelentkezett session-nel',
     handler: 'tools/call',
     inputSchema: {
@@ -234,6 +265,8 @@ export const tools = [
 
   {
     name: 'brave_list_sessions',
+    title: 'Mentett munkamenetek listája',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     description: 'Aktív session-ök listázása',
     handler: 'tools/call',
     inputSchema: {
@@ -247,6 +280,8 @@ export const tools = [
 
   {
     name: 'brave_clear_sessions',
+    title: 'Mentett munkamenetek törlése',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     description: 'Session-ök törlése',
     handler: 'tools/call',
     inputSchema: {
@@ -266,6 +301,8 @@ export const tools = [
 
   {
     name: 'brave_visual_captcha',
+    title: 'Látható lap: kép alapú kattintás/gépelés',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     description: 'CAPTCHA vizuális kezelése screenshot alapján',
     handler: 'tools/call',
     inputSchema: {
@@ -298,6 +335,8 @@ export const tools = [
 
   {
     name: 'brave_mouse_control',
+    title: 'Látható lap: egérművelet',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     description: 'Teljes egér kontroll - mozgatás, kattintás, húzás',
     handler: 'tools/call',
     inputSchema: {
@@ -323,6 +362,8 @@ export const tools = [
 
   {
     name: 'brave_visual_inspect',
+    title: 'Látható lap: elemfelismerés',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     description: 'Vizuális elem felismerés és interakció',
     handler: 'tools/call',
     inputSchema: {
@@ -347,7 +388,9 @@ export const tools = [
 
   {
     name: 'brave_page',
-    description: 'Izolált böngésző-lap (saját inkognitó kontextus) Firecrawl-nevű actionökkel: wait, click (selector/text/x,y), write, press, scroll, screenshot, scrape, executeJavascript (CSAK a lapban), generatePDF, navigate. Kimenet: html/text/links/screenshot (JPEG, ~1.5 MB plafon). keep_session=true → session_id (tétlen TTL 300 s, abszolút 30 perc, max 4 egyszerre); profile → sütik+localStorage megőrzése névvel. Csak http/https; belső/loopback címek tiltva (blocked.reason). Egy hívás max ~25 s.',
+    title: 'Izolált böngésző-lap lépésekkel',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    description: 'Izolált böngésző-lap (saját inkognitó kontextus) Firecrawl-nevű actionökkel: wait, click (selector/text/x,y), write, press, scroll, screenshot, scrape, executeJavascript (CSAK a lapban), generatePDF, navigate; + select (opció value/felirat), clear (billentyűzetes ürítés). Csak valódi (trusted) egér/billentyű; JS-fallback csak warningként (untrusted_*). Hibás lépésnél action_results[].why (matches, covered_by…) + next; write után kept (full/truncated/reformatted/emptied/focus_moved). Kimenet: html/text/links/screenshot (JPEG, ~1.5 MB). keep_session=true → session_id (tétlen TTL 300 s, abszolút 30 perc, max 4); profile → sütik+localStorage névvel. Csak http/https; belső címek tiltva (blocked.reason). Max ~25 s.',
     handler: 'tools/call',
     inputSchema: {
       type: 'object',
@@ -358,14 +401,15 @@ export const tools = [
         close: { type: 'boolean', description: 'A munkamenet lezárása a hívás végén (default false)' },
         actions: {
           type: 'array',
-          description: 'Sorban végrehajtott lépések. type: wait{milliseconds?,selector?} | click{selector?,text?,x?,y?,all?} | write{text,selector?} | press{key} | scroll{direction:up|down,amount?,selector?} | screenshot{fullPage?,quality?,viewport?{width,height}} | scrape | executeJavascript{script} | generatePDF{format?,landscape?,scale?} | navigate{url}',
+          description: 'Sorban végrehajtott lépések. type: wait{milliseconds?,selector?} | click{selector?,text?,x?,y?,all?} | write{text,selector?} | select{selector,value} | clear{selector?} | press{key} | scroll{direction:up|down,amount?,selector?} | screenshot{fullPage?,quality?,viewport?{width,height}} | scrape | executeJavascript{script} | generatePDF{format?,landscape?,scale?} | navigate{url}',
           items: {
             type: 'object',
             properties: {
-              type: { type: 'string', enum: ['wait', 'click', 'write', 'press', 'scroll', 'screenshot', 'scrape', 'executeJavascript', 'generatePDF', 'pdf', 'navigate'] },
+              type: { type: 'string', enum: ['wait', 'click', 'write', 'select', 'clear', 'press', 'scroll', 'screenshot', 'scrape', 'executeJavascript', 'generatePDF', 'pdf', 'navigate'] },
               milliseconds: { type: 'number' },
               selector: { type: 'string' },
               text: { type: 'string' },
+              value: { type: 'string' },
               x: { type: 'number' },
               y: { type: 'number' },
               all: { type: 'boolean' },

@@ -26,6 +26,10 @@ import crypto from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { BLOCK_HEADER } from './egress.js';
+import {
+  diagnoseInPage, nextMove, diagnoseSelector, isBadSelectorError, fieldStateInPage, keptVerdict,
+  describeInPage, NEXT_MOVE,
+} from './action-diagnose.js';
 
 const envInt = (k, d) => {
   const v = parseInt(process.env[k] ?? '', 10);
@@ -737,13 +741,183 @@ export class PageSessionManager {
     return el;
   }
 
-  async _clickHandle(el) {
+  // ── P2-1 (R2-E, 2026-10-07): CSAK trusted kattintás, látható fallbackkal ──
+  // MIÉRT: a régi út a puppeteer `el.click()`-je volt, hibánál NÉMA `n.click()`
+  // (JS, isTrusted=false) — egy takart gombra a valódi egér a TAKARÓ elemre
+  // kattintott (cookie-banner), a JS-út pedig átnyúlt a takarón, amit ember nem
+  // tud. Most: görgetés a látómezőbe → diagnózis (action-diagnose.js) → valódi
+  // egérkattintás egy olyan pontra, ahol a találat az elem maga. Takart vagy
+  // letiltott elemre NEM kattintunk: {ok:false, why} — a hívó a `why.covered_by`-
+  // ból látja, mit kell előbb bezárni. JS-`click()` CSAK, ha az elemnek nincs
+  // kattintható doboza (0 méret, display:none, látómezőn kívül maradt) — és akkor
+  // is kimondva: warnings `untrusted_click_fallback`, az eredményben `untrusted`.
+  async _clickHandle(page, el, warn) {
+    let scrolled = false;
     try {
-      await el.click();
-    } catch (e) {
-      // Nem látható / takart elem: DOM-szintű click (a Firecrawl is ezt teszi).
-      await el.evaluate((n) => n.click());
+      scrolled = await el.evaluate((n) => {
+        const r = n.getBoundingClientRect();
+        const bent = r.top >= 0 && r.left >= 0 && r.bottom <= window.innerHeight && r.right <= window.innerWidth;
+        if (bent) return false;
+        if (typeof n.scrollIntoViewIfNeeded === 'function') n.scrollIntoViewIfNeeded(true);
+        else n.scrollIntoView({ block: 'center', inline: 'center' });
+        return true;
+      });
+    } catch (_) { /* leválasztott elem — a diagnózis kimondja */ }
+    if (scrolled) {
+      // `scroll-behavior: smooth` lapon a görgetés animál: a kattintási pontot csak
+      // a megállás után mérjük (különben a mozgó elem mellé kattintanánk).
+      let prev = null;
+      for (let i = 0; i < 12; i++) {
+        const pos = await el.evaluate((n) => { const b = n.getBoundingClientRect(); return `${Math.round(b.top)},${Math.round(b.left)}`; }).catch(() => null);
+        if (pos === prev) break;
+        prev = pos;
+        await sleep(50);
+      }
     }
+    let d = null;
+    try { d = await el.evaluate(diagnoseInPage); } catch (_) { d = null; }
+    const why = d ? { ...d } : null;
+    if (why) delete why.point;
+    if (d && (d.covered_by || d.disabled)) return { ok: false, why };
+    if (d && d.point) {
+      await page.mouse.click(d.point.x, d.point.y);
+      return { ok: true, mode: 'mouse' };
+    }
+    if (!d) {
+      // A diagnózis nem futott (pl. a lap épp cserélődik): a puppeteer saját,
+      // szintén valódi egeres kattintása — és csak ha az is bukik, JS.
+      try { await el.click(); return { ok: true, mode: 'mouse' }; } catch (_) { /* lent: JS */ }
+    }
+    await el.evaluate((n) => n.click());
+    warn('untrusted_click_fallback');
+    return { ok: true, mode: 'js', why };
+  }
+
+  // P1-2: a hibás akció eredménye diagnózissal + „mit tegyél" mondattal.
+  _failWhy(r, error, why, next) {
+    r.error = String(error || 'action_failed').split('\n')[0].slice(0, 200);
+    if (why && typeof why === 'object') r.why = why;
+    r.next = next || nextMove(why);
+    return r;
+  }
+
+  // Elem várása szelektorra; hibánál a lap diagnózisával (P1-2).
+  // Vissza: { el } | { error, why }.
+  async _waitEl(page, selector, rem) {
+    const sel = String(selector);
+    // Rossz szintaxis: AZONNAL (a waitForSelector a teljes timeoutot kivárná — mérve).
+    try { const h = await page.$(sel); if (h) await h.dispose(); } catch (e) {
+      if (isBadSelectorError(e)) return { error: String(e?.message || e), why: { bad_selector: true } };
+    }
+    try {
+      const el = await page.waitForSelector(sel, { timeout: Math.max(100, Math.min(rem(), 10000)) });
+      if (el) return { el };
+      return { error: 'no element matches selector', why: { matches: 0 } };
+    } catch (e) {
+      if (e instanceof BudgetError) throw e;
+      let why = null;
+      if (isBadSelectorError(e)) why = { bad_selector: true };
+      else why = await bounded(diagnoseSelector(page, sel), Math.max(300, Math.min(3000, rem())), 'diagnose').catch(() => null);
+      return { error: String(e?.message || e), why: why || { matches: 0 } };
+    }
+  }
+
+  // Szerkeszthető-e (gépelés / ürítés előtt): letiltott vagy csak olvasható → nem.
+  async _notEditable(el) {
+    let d = null;
+    try { d = await el.evaluate(diagnoseInPage); } catch (_) { return null; }
+    if (d && (d.disabled || d.readonly)) { delete d.point; return d; }
+    return null;
+  }
+
+  // A cél-mező: a szelektoré, vagy (szelektor nélkül) a fókuszban lévő elem.
+  async _activeEl(page) {
+    try {
+      const h = await page.evaluateHandle(() => document.activeElement);
+      const el = h.asElement();
+      if (!el) await h.dispose();
+      return el;
+    } catch (_) { return null; }
+  }
+
+  async _fieldState(el) {
+    if (!el) return null;
+    try { return await el.evaluate(fieldStateInPage); } catch (_) { return null; }
+  }
+
+  // Billentyűzetes ürítés (P2-1): fókusz → Ctrl/Cmd+A → Backspace, visszaolvasva.
+  // A régi motor-oldali `el.value = ''` + szintetikus input-esemény egy React-
+  // szerű vezérelt mezőn a DOM-ot ürítette, a belső állapotot NEM (mérve: a
+  // következő render visszaírta a régi értéket).
+  async _clearField(page, el) {
+    await el.focus();
+    const mod = process.platform === 'darwin' ? 'Meta' : 'Control';
+    const pressAll = async () => {
+      await page.keyboard.down(mod);
+      try { await page.keyboard.press('KeyA'); } finally { await page.keyboard.up(mod); }
+      await page.keyboard.press('Backspace');
+    };
+    await pressAll();
+    let st = await this._fieldState(el);
+    if (st && typeof st.value === 'string' && st.value !== '') {
+      // Második kör: a fókusz közben elmozdulhatott (fókusz-kezelő) — újra.
+      await el.focus();
+      await pressAll();
+      st = await this._fieldState(el);
+    }
+    return st;
+  }
+
+  // P2-1: <select> opció kiválasztása BILLENTYŰZETTEL (fókusz → Nyíl le/fel, amíg
+  // a kért opció nem az aktív; a böngésző a letiltott opciókat maga átugorja).
+  // Ha így nem áll be (többes select, egyedi vezérlő), a JS-beállítás CSAK
+  // kimondva: warnings `untrusted_select_fallback`.
+  async _selectOption(page, el, want, rem, warn) {
+    const info = await el.evaluate((n, wantRaw) => {
+      if (n.tagName !== 'SELECT') return { error: 'not_a_select', tag: n.tagName.toLowerCase() };
+      const w = String(wantRaw).trim().toLowerCase();
+      const opts = Array.from(n.options);
+      let idx = opts.findIndex(o => String(o.value).toLowerCase() === w);
+      let by = 'value';
+      if (idx < 0) { idx = opts.findIndex(o => String(o.text).trim().toLowerCase() === w); by = 'label'; }
+      if (idx < 0) { idx = opts.findIndex(o => String(o.text).trim().toLowerCase().includes(w)); by = 'label_contains'; }
+      if (idx < 0) return { error: 'option_not_found', options: opts.slice(0, 20).map(o => String(o.text).trim().slice(0, 60)) };
+      if (opts[idx].disabled) return { error: 'option_disabled' };
+      return { index: idx, current: n.selectedIndex, multiple: !!n.multiple, disabled: !!n.disabled,
+        label: String(opts[idx].text).trim().slice(0, 80), by };
+    }, want);
+    if (info.error) return { ok: false, info };
+    if (info.disabled) return { ok: false, info: { error: 'select_disabled' }, why: { disabled: true } };
+    const cur = () => el.evaluate((n) => n.selectedIndex).catch(() => -2);
+    let trusted = false;
+    if (info.index === info.current) {
+      return { ok: true, selected: info.label, by: info.by, unchanged: true };
+    }
+    if (!info.multiple) {
+      await el.focus();
+      const key = info.index > info.current ? 'ArrowDown' : 'ArrowUp';
+      let last = info.current;
+      for (let i = 0; i < 600 && rem() > 200; i++) {
+        await page.keyboard.press(key);
+        const now = await cur();
+        if (now === info.index) { trusted = true; break; }
+        if (now === last || now === -2) break;            // nem mozdul (egyedi vezérlő) / közben eltűnt
+        if ((key === 'ArrowDown' && now > info.index) || (key === 'ArrowUp' && now < info.index)) break;
+        last = now;
+      }
+    }
+    if (!trusted) {
+      const ok = await el.evaluate((n, idx) => {
+        n.selectedIndex = idx;
+        n.dispatchEvent(new Event('input', { bubbles: true }));
+        n.dispatchEvent(new Event('change', { bubbles: true }));
+        return n.selectedIndex === idx;
+      }, info.index).catch(() => false);
+      if (!ok) return { ok: false, info: { error: 'select_failed' } };
+      warn('untrusted_select_fallback');
+      return { ok: true, selected: info.label, by: info.by, untrusted: true };
+    }
+    return { ok: true, selected: info.label, by: info.by };
   }
 
   async _runAction(s, a, deadline, reserveMs, warn, counters) {
@@ -757,7 +931,16 @@ export class PageSessionManager {
         const ms = a.milliseconds !== undefined ? clampInt(a.milliseconds, 0, 120000, 0) : null;
         if (a.selector) {
           const t = Math.max(100, Math.min(rem(), ms || rem()));
-          await page.waitForSelector(String(a.selector), { timeout: t });
+          try {
+            // rossz szintaxis azonnal dob (a waitForSelector kivárná a timeoutot)
+            const h0 = await page.$(String(a.selector)); if (h0) await h0.dispose();
+            await page.waitForSelector(String(a.selector), { timeout: t });
+          } catch (e) {
+            if (e instanceof BudgetError) throw e;
+            const why = isBadSelectorError(e) ? { bad_selector: true }
+              : await bounded(diagnoseSelector(page, String(a.selector)), Math.max(300, Math.min(2000, rem())), 'diagnose').catch(() => null);
+            return this._failWhy(r, e?.message || e, why || { matches: 0 });
+          }
         } else if (ms !== null) {
           if (ms > rem()) warn(`wait_truncated: ${ms}ms → ${Math.max(0, rem())}ms`);
           await sleep(Math.min(ms, rem()));
@@ -768,27 +951,53 @@ export class PageSessionManager {
         break;
       }
       case 'click': {
+        // Az eredmény: clicked (darab), hibánál why + next (P1-2); JS-úton `untrusted`.
+        const one = async (el) => {
+          let cr = null;
+          await this._settleAfterInput(s, async () => { cr = await this._clickHandle(page, el, warn); }, deadline, reserveMs, warn);
+          return cr || { ok: false, why: null };
+        };
+        const notClickable = (why) => (why?.covered_by
+          ? `not_clickable: covered by ${why.covered_by.tag}${why.covered_by.id ? '#' + why.covered_by.id : ''}`
+          : why?.disabled ? 'not_clickable: disabled' : 'not_clickable');
         if (a.selector && a.all) {
           const els = await page.$$(String(a.selector));
-          let n = 0;
+          let n = 0, skipped = 0, firstWhy = null, js = 0;
           await this._settleAfterInput(s, async () => {
             for (const el of els) {
               if (rem() < 200) break;
-              try { await this._clickHandle(el); n++; } catch (_) { /* elem közben eltűnt */ }
+              try {
+                const cr = await this._clickHandle(page, el, warn);
+                if (cr.ok) { n++; if (cr.mode === 'js') js++; } else { skipped++; firstWhy = firstWhy || cr.why; }
+              } catch (_) { /* elem közben eltűnt */ }
             }
           }, deadline, reserveMs, warn);
           r.clicked = n;
+          if (js) r.untrusted = js;
+          if (skipped) { r.not_clicked = skipped; r.why = firstWhy; r.next = nextMove(firstWhy); }
         } else if (a.selector) {
-          const el = await page.waitForSelector(String(a.selector), { timeout: Math.max(100, Math.min(rem(), 10000)) });
-          await this._settleAfterInput(s, () => this._clickHandle(el), deadline, reserveMs, warn);
+          const w = await this._waitEl(page, a.selector, rem);
+          if (!w.el) return this._failWhy(r, w.error, w.why);
+          const cr = await one(w.el);
+          if (!cr.ok) return this._failWhy(r, notClickable(cr.why), cr.why);
+          if (cr.mode === 'js') { r.untrusted = true; if (cr.why) r.why = cr.why; }
           r.clicked = 1;
         } else if (typeof a.text === 'string' && a.text.trim()) {
           const el = await bounded(this._findByText(page, a.text), Math.max(200, rem()), 'find_text');
-          if (!el) { r.error = 'no element matches text'; return r; }
-          await this._settleAfterInput(s, () => this._clickHandle(el), deadline, reserveMs, warn);
+          if (!el) return this._failWhy(r, 'no element matches text', { matches: 0 }, NEXT_MOVE.text_matches);
+          const cr = await one(el);
+          if (!cr.ok) return this._failWhy(r, notClickable(cr.why), cr.why);
+          if (cr.mode === 'js') { r.untrusted = true; if (cr.why) r.why = cr.why; }
           r.clicked = 1;
         } else if (Number.isFinite(Number(a.x)) && Number.isFinite(Number(a.y))) {
-          await this._settleAfterInput(s, () => page.mouse.click(Number(a.x), Number(a.y)), deadline, reserveMs, warn);
+          const x = Number(a.x), y = Number(a.y);
+          // A koordináta-lépcsőfok: kimondjuk, MIRE esett a kattintás (érték nélkül).
+          try {
+            const h = await page.evaluateHandle((px, py) => document.elementFromPoint(px, py), x, y);
+            const hit = h.asElement();
+            if (hit) { r.target = await hit.evaluate(describeInPage); await hit.dispose(); } else await h.dispose();
+          } catch (_) { /* a lap közben cserélődött */ }
+          await this._settleAfterInput(s, () => page.mouse.click(x, y), deadline, reserveMs, warn);
           r.clicked = 1;
         } else {
           r.error = 'click requires selector, text or x/y';
@@ -800,10 +1009,18 @@ export class PageSessionManager {
         if (typeof a.text !== 'string') { r.error = 'write requires text'; return r; }
         let text = a.text;
         if (text.length > 20000) { text = text.slice(0, 20000); warn('write_truncated: max 20000 chars'); }
+        let el = null;
         if (a.selector) {
-          const el = await page.waitForSelector(String(a.selector), { timeout: Math.max(100, Math.min(rem(), 10000)) });
+          const w = await this._waitEl(page, a.selector, rem);
+          if (!w.el) return this._failWhy(r, w.error, w.why);
+          el = w.el;
+          const ne = await this._notEditable(el);
+          if (ne) return this._failWhy(r, `not_editable: ${ne.disabled ? 'disabled' : 'readonly'}`, ne);
           await el.focus();
+        } else {
+          el = await this._activeEl(page);
         }
+        const before = await this._fieldState(el);
         if (text.length <= 1000) {
           await bounded(page.keyboard.type(text), Math.max(200, rem()), 'write');
         } else {
@@ -811,6 +1028,62 @@ export class PageSessionManager {
           await bounded(page.keyboard.sendCharacter(text), Math.max(200, rem()), 'write');
           warn('write_inserted_at_once: text > 1000 chars');
         }
+        // P2-2: a mező visszaolvasása — MIT tartott meg (érték NÉLKÜL, csak hossz).
+        const after = await this._fieldState(el);
+        if (after) {
+          const k = keptVerdict(text, before, after);
+          r.kept = k.kept;
+          r.kept_len = k.kept_len;
+          r.typed_len = k.typed_len;
+          if (k.focus_moved) r.focus_moved = true;
+          if (k.maxlength !== undefined) r.maxlength = k.maxlength;
+          r.kept_note = k.note;
+        }
+        break;
+      }
+      case 'clear': {
+        // Saját bővítés (nem Firecrawl): billentyűzetes mező-ürítés, visszaolvasva.
+        let el = null;
+        if (a.selector) {
+          const w = await this._waitEl(page, a.selector, rem);
+          if (!w.el) return this._failWhy(r, w.error, w.why);
+          el = w.el;
+        } else {
+          el = await this._activeEl(page);
+          if (!el) return this._failWhy(r, 'no focused field to clear', { matches: 0 });
+        }
+        const ne = await this._notEditable(el);
+        if (ne) return this._failWhy(r, `not_editable: ${ne.disabled ? 'disabled' : 'readonly'}`, ne);
+        const st = await bounded(this._clearField(page, el), Math.max(300, rem()), 'clear');
+        if (!st || st.value === null) return this._failWhy(r, 'not_a_text_field', null, NEXT_MOVE.not_a_text_field);
+        r.cleared = st.value === '';
+        if (!r.cleared) {
+          r.kept_len = st.value.length;
+          return this._failWhy(r, 'clear_failed', { kept_len: st.value.length }, NEXT_MOVE.clear_failed);
+        }
+        break;
+      }
+      case 'select': {
+        // Saját bővítés (nem Firecrawl): <select> opció value VAGY felirat szerint.
+        const want = [a.value, a.text, a.label].find(v => typeof v === 'string' && v.trim());
+        if (!a.selector || !want) { r.error = 'select requires selector and value (or text)'; return r; }
+        const w = await this._waitEl(page, a.selector, rem);
+        if (!w.el) return this._failWhy(r, w.error, w.why);
+        let so = null;
+        await this._settleAfterInput(s, async () => { so = await this._selectOption(page, w.el, want, rem, warn); }, deadline, reserveMs, warn);
+        if (!so || !so.ok) {
+          const info = so?.info || {};
+          if (info.error === 'option_not_found') {
+            r.options = info.options;
+            return this._failWhy(r, 'option_not_found', { matches: 1, option_matches: 0 }, NEXT_MOVE.option_not_found);
+          }
+          if (info.error === 'not_a_select') return this._failWhy(r, 'not_a_select', { matches: 1, tag: info.tag }, NEXT_MOVE.not_a_select);
+          return this._failWhy(r, info.error || 'select_failed', so?.why || null);
+        }
+        r.selected = so.selected;
+        r.matched_by = so.by;
+        if (so.unchanged) r.unchanged = true;
+        if (so.untrusted) r.untrusted = true;
         break;
       }
       case 'press': {
@@ -824,7 +1097,10 @@ export class PageSessionManager {
         const dy = dir * amount;
         if (a.selector) {
           const ok = await page.$eval(String(a.selector), (el, d) => { el.scrollBy(0, d); return true; }, dy).catch(() => false);
-          if (!ok) { r.error = 'scroll selector not found'; return r; }
+          if (!ok) {
+            const why = await bounded(diagnoseSelector(page, String(a.selector)), Math.max(300, Math.min(2000, rem())), 'diagnose').catch(() => null);
+            return this._failWhy(r, 'scroll selector not found', why || { matches: 0 });
+          }
         } else {
           await page.evaluate((d) => window.scrollBy(0, d), dy);
         }

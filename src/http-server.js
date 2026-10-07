@@ -3,7 +3,7 @@ import cors from 'cors';
 import https from 'https';
 import { WebSocketServer } from 'ws';
 import { BraveController } from './brave-controller.js';
-import { tools } from './tools.js';
+import { tools, toolListEntry } from './tools.js';
 import dotenv from 'dotenv';
 import { createRequire } from 'module';
 import crypto from 'crypto';
@@ -290,11 +290,7 @@ app.get('/health/deep', async (req, res) => {
 
 // Tools list endpoint
 app.get('/tools', (req, res) => {
-  const toolList = tools.map(tool => ({
-    name: tool.name,
-    description: tool.description,
-    inputSchema: tool.inputSchema
-  }));
+  const toolList = tools.map(toolListEntry);
   
   res.json({ tools: toolList });
 });
@@ -397,11 +393,7 @@ app.post('/mcp', async (req, res) => {
     }
 
     if (method === 'tools/list') {
-      const toolList = tools.map(tool => ({
-        name: tool.name,
-        description: tool.description,
-        inputSchema: tool.inputSchema
-      }));
+      const toolList = tools.map(toolListEntry);
 
       return res.json({
         jsonrpc: '2.0',
@@ -552,11 +544,7 @@ wss.on('connection', (ws) => {
       console.log('📨 WebSocket message:', _safeTok(message.method));
       
       if (message.method === 'tools/list') {
-        const toolList = tools.map(tool => ({
-          name: tool.name,
-          description: tool.description,
-          inputSchema: tool.inputSchema
-        }));
+        const toolList = tools.map(toolListEntry);
         
         ws.send(JSON.stringify({
           id: message.id,
