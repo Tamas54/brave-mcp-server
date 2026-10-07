@@ -32,6 +32,14 @@ DEBUG=true                              # részletes logok
 
 # HTTP szerver port (Claude Browser számára)
 HTTP_PORT=3002
+
+# TF-evasions (2026-10-07, alapból KI; indításkor olvasott) — a tf-playwright-stealth
+# fork persona-rétege: koherens UA ↔ platform ↔ UA-CH ↔ nyelv ↔ WebGL a scrape-sávon.
+# Részletek: src/stealth/tf-evasions/, THIRD_PARTY_NOTICES.md; A/B: scripts/stealth-ab.mjs
+# STEALTH_TF_EVASIONS=1
+# STEALTH_TF_PERSONA_OS=host              # host (alap, a gazdagép OS-e) | ua (a kért UA OS-e)
+# STEALTH_TF_WEBGL=native                 # native (alap, nincs WebGL-hamisítás) | mask (fork webgl.vendor)
+# STEALTH_TF_LANGUAGES=en-US,en           # q-értékek nélkül
 ```
 
 ### 🚀 Indítási módok

@@ -14,6 +14,9 @@ import {
   BLOCK_HEADER, hostOnly, redactUrls,
 } from './egress.js';
 import { PageSessionManager } from './brave-page.js';
+import {
+  tfEvasionsEnabled, tfEvasionsPlugin, pruneSupersededEvasions, applyTfPersona, tfHealth,
+} from './stealth/tf-evasions/index.js';
 
 const execFileP = promisify(execFile);
 
@@ -29,7 +32,17 @@ const __dirname = path.dirname(__filename);
 // és más viselkedés-elemző anti-bot pipeline-ok ellen. A StealthPlugin réteg
 // FÖLÖTTE marad — a két javítás kumulált.
 const puppeteer = addExtra(rebrowserPuppeteer);
-puppeteer.use(StealthPlugin());
+// 2026-10-07: TF-evasions (TINYFISH PARITY 2.9) — STEALTH_TF_EVASIONS=1-re a
+// tf-playwright-stealth fork persona-rétege (CDP-s UA/UA-CH/nyelv + WebGL)
+// váltja a puppeteer-extra 4 ellentmondó evasionjét. Alapból KI: ilyenkor a
+// pluginlánc bitre a régi. Indításkor olvasott kapcsoló (lásd src/stealth/tf-evasions/).
+const TF_EVASIONS = tfEvasionsEnabled();
+{
+  const stealth = StealthPlugin();
+  if (TF_EVASIONS) pruneSupersededEvasions(stealth);
+  puppeteer.use(stealth);
+  if (TF_EVASIONS) puppeteer.use(tfEvasionsPlugin());
+}
 
 // 2026-07-01: SCRAPE-SÁV FÉK — concurrency-cap + böngésző-recycle. A Brave MCP
 // megosztott instance-át az Echolot háttér-scrape-je folyamatosan terheli; fék
@@ -742,24 +755,39 @@ export class BraveController {
         const ua = BraveController.UA_POOL[
           Math.floor(Math.random() * BraveController.UA_POOL.length)
         ];
-        await page.setUserAgent(ua);
+        // 2026-10-07: TF-kapcsolóval a pool-UA-ból legfeljebb az OS számít
+        // (STEALTH_TF_PERSONA_OS=ua; az alap 'host' a gazdagép OS-ét adja); a
+        // verzió a futó böngészőé, és a UA-CH / platform / nyelv vele együtt megy
+        // (a metadata nélküli setUserAgent a UA-CH-t kiüresítette — mérve).
+        if (TF_EVASIONS) await applyTfPersona(page, { uaHint: ua });
+        else await page.setUserAgent(ua);
         await page.setViewport({
           width: 1366 + Math.floor(Math.random() * 200),
           height: 768 + Math.floor(Math.random() * 200),
         });
         // Extra fejlécek — egyes Cloudflare-fogadópontok ezeket figyelik.
-        await page.setExtraHTTPHeaders({
-          'Accept-Language': 'en-US,en;q=0.9,hu;q=0.8',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-          'Upgrade-Insecure-Requests': '1',
-        });
+        // TF-kapcsolóval NEM: a setExtraHTTPHeaders MINDEN kérésre (kép, XHR,
+        // fetch) ráteszi a dokumentum-Accept-et és az Upgrade-Insecure-Requests-
+        // et (a valódi Chrome fetch-nél '*/*'-ot küld, UIR-t csak navigációnál
+        // — mérve), az Accept-Language-et pedig a persona adja natívan, a
+        // navigator.languages-szel egy forrásból (a fork STEALTH_DIFF 3.17-es leckéje).
+        if (!TF_EVASIONS) {
+          await page.setExtraHTTPHeaders({
+            'Accept-Language': 'en-US,en;q=0.9,hu;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Upgrade-Insecure-Requests': '1',
+          });
+        }
         // Per-domain cookie-jar load — Cloudflare cf_clearance és társai.
         // Egy korábban megnyert challenge ~30 perc – 2 óra élethosszú, így a
         // következő scrape-ek azonnal átmennek.
         await this._loadDomainCookies(page, url);
       } else {
-        // Default fast-path UA — a meglévő viselkedés (statdata path)
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+        // Default fast-path UA — a meglévő viselkedés (statdata path).
+        // TF-kapcsolóval: persona a futó böngésző verziójával (a fix Chrome/120
+        // a valódi motorhoz képest ~34 verzióval öregebb).
+        if (TF_EVASIONS) await applyTfPersona(page, { uaHint: BraveController.DEFAULT_SCRAPE_UA });
+        else await page.setUserAgent(BraveController.DEFAULT_SCRAPE_UA);
       }
 
       // 2026-09-22: a proxy mögött a Chrome DNS-hibája ERR_TUNNEL_CONNECTION_FAILED
@@ -2579,6 +2607,8 @@ export class BraveController {
         ? (this._egress ? this._egress.health() : { enabled: true, proxy_up: false })
         : { enabled: false },
       page_sessions: this._pageMgr ? this._pageMgr.health() : { sessions: 0 },
+      // 2026-10-07: TF-evasions kapcsoló (indításkor olvasva).
+      stealth_tf: TF_EVASIONS ? tfHealth() : { enabled: false },
     };
   }
 
@@ -3385,6 +3415,9 @@ BraveController.DIET_BLOCKED_HOSTS = [
   'newrelic.com',
   'nr-data.net',
 ];
+
+// A default scrape-szint UA-ja (a TF-kapcsolóval ebből csak az OS számít).
+BraveController.DEFAULT_SCRAPE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // User-Agent pool — Chrome 120-122 desktop variants (Win/Mac/Linux). A scrape()
 // minden hívásnál véletlenszerűt választ → a TLS-fingerprint statisztika nem
