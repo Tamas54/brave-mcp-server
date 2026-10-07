@@ -26,6 +26,8 @@ import crypto from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { BLOCK_HEADER } from './egress.js';
+import { solveOnReadPath } from './captcha/read-path.js';
+import { fromHumanInput } from './captcha/pointer.js';
 import {
   diagnoseInPage, nextMove, diagnoseSelector, isBadSelectorError, fieldStateInPage, keptVerdict,
   describeInPage, NEXT_MOVE,
@@ -1318,6 +1320,33 @@ export class PageSessionManager {
         const avail = deadline - Date.now() - reserveMs;
         if (w > avail) warn(`wait_ms_truncated: ${w} → ${Math.max(0, avail)}`);
         await sleep(Math.min(w, Math.max(0, avail)));
+      }
+
+      // ─── C2 — CAPTCHA-fal, CSAK az egyszeri OLVASÓ hívásban — 2026-10-07 ──
+      // purpose:"read" (az engine fetch Chrome-foka) ÉS nincs munkamenet: se
+      // session_id, se keep_session. A munkamenetes brave_page (interact/goal,
+      // űrlapok) SOHA nem hívja a megoldót — ott a kérés is láthatóan elutasított.
+      // A megoldás a navigáció (és a wait_ms) után, az actionök ELŐTT fut: a
+      // nyitó falat lépi át, nem a hívó lépései közben felbukkanó CAPTCHA-t.
+      if (args.purpose === 'read') {
+        if (sid || keep) {
+          warn('captcha_solver_skipped: session path (purpose "read" only applies to one-shot calls)');
+        } else if (navOk && !out.blocked) {
+          let cap = null;
+          try {
+            const human = typeof this.c?._humanInput === 'function' ? (fromHumanInput(this.c._humanInput()) || undefined) : undefined;
+            cap = await solveOnReadPath(page, { purpose: 'read', deadlineTs: deadline - reserveMs - 300, human });
+          } catch (e) {
+            cap = { status: 'failed', error: `internal:${String(e?.message || e).split('\n')[0].slice(0, 80)}` };
+          }
+          if (cap) {
+            out.captcha = cap;
+            warn(`captcha_${cap.status}:${cap.vendor || '?'}:${cap.kind || '?'}${cap.reason ? `:${cap.reason}` : ''}${cap.error ? `:${cap.error}` : ''}`);
+          }
+          if (cur.mainBlocked && !out.blocked) { out.blocked = { reason: cur.mainBlocked }; navOk = false; out.error = 'egress_blocked'; }
+          const bad = await this._schemeGuard(s).catch(() => null);
+          if (bad && !out.blocked) { out.blocked = { reason: bad }; navOk = false; out.error = 'egress_blocked'; }
+        }
       }
 
       // Actionök sorban; az első hiba után a többi kimarad (láthatóan).
