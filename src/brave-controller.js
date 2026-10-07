@@ -16,7 +16,7 @@ import {
 import { PageSessionManager } from './brave-page.js';
 import { solveOnReadPath, solverEnabled as captchaSolverEnabled } from './captcha/read-path.js';
 import { fromHumanInput } from './captcha/pointer.js';
-import { toolTimeoutMs } from './tool-timeout.js';
+import { toolTimeoutMs, readChallengeCeilingMs } from './tool-timeout.js';
 import {
   tfEvasionsEnabled, tfEvasionsPlugin, pruneSupersededEvasions, applyTfPersona, tfHealth,
 } from './stealth/tf-evasions/index.js';
@@ -1013,7 +1013,11 @@ export class BraveController {
       // mozdulattal, aktív megoldó-szolgáltatóval (CAPTCHA_SOLVER_PROVIDER) a
       // megoldó-horog. A válaszban `challenge: {type, waited_ms, passed, …}`.
       // Normál lapon (nincs jel) 0 többletidő. CHALLENGE_WAIT_MS=0 → a régi út.
+      // 2026-10-08 (rel-wall): reCAPTCHA v2 / hCaptcha-kapun, ha a C2 megoldó
+      // engedélyezett, a W2 NEM kattint és NEM vár — azonnal átadja a lenti C2-
+      // blokknak (challenge.js captchaHandoff); az átjutásról a C2 eredménye dönt.
       let challengeInfo = null;
+      const c2On = captchaSolverEnabled();
       if (chCfg.waitMs > 0) {
         const det = detectChallengeHtml(html);
         if (det) {
@@ -1024,7 +1028,7 @@ export class BraveController {
           const { info, html: after } = await handleChallenge(page, det, {
             waitMs: chCfg.waitMs, interactiveWaitMs: chCfg.interactiveWaitMs, pollMs: chCfg.pollMs,
             deadlineTs: dls.length ? Math.min(...dls) - 300 : 0,
-            solve: chCfg.solve, purpose: 'read',
+            solve: chCfg.solve, purpose: 'read', captchaHandoff: c2On,
             human: this._humanInput(), humanizeIdle: this._humanizeOn(),
             busy: () => this._scrapeGate._waiters.length > 0, busyWaitMs: chCfg.busyWaitMs,
           });
@@ -1032,10 +1036,15 @@ export class BraveController {
           challengeInfo = info;
           if (after) html = after;
           else { try { html = await page.content(); } catch (_) { /* a régi html marad */ } }
-          cfStatus = info.passed ? 'cleared_attempt_1' : 'blocked';
-          console.log(`[challenge] ${info.type} host=${hostOnly(url)} passed=${info.passed} waited=${info.waited_ms}ms` +
-            `${info.solve?.clicks ? ` clicks=${info.solve.clicks}` : ''}`);
-          if (info.passed) await this._saveClearance(page, url);
+          if (info.handoff) {
+            // az ítélet (passed / cf_status / clearance) a C2 után, lent
+            console.log(`[challenge] ${info.final_type || info.type} host=${hostOnly(url)} → C2 megoldó (átadás ${info.waited_ms}ms után)`);
+          } else {
+            cfStatus = info.passed ? 'cleared_attempt_1' : 'blocked';
+            console.log(`[challenge] ${info.type} host=${hostOnly(url)} passed=${info.passed} waited=${info.waited_ms}ms` +
+              `${info.solve?.clicks ? ` clicks=${info.solve.clicks}` : ''}`);
+            if (info.passed) await this._saveClearance(page, url);
+          }
         }
       } else if (stealthMode && this._isCloudflareChallenge(html)) {
         cfStatus = 'attempt_1';
@@ -1071,7 +1080,7 @@ export class BraveController {
       // régi. Határidő: a crawl oldal-határideje, különben a tool-hívás plafonja
       // mínusz tartalék (a 25 s-os külső vágás előtt végezzünk).
       let captchaInfo = null;
-      if (!killed && captchaSolverEnabled()) {
+      if (!killed && c2On) {
         const capDeadline = deadlineTs || (scrapeT0 + toolTimeoutMs('brave_scrape', options) - 4000);
         // a W2 „keze" (HumanInput, egy böngésző = egy mag), ha a vezérlőn már van
         const human = typeof this._humanInput === 'function' ? (fromHumanInput(this._humanInput()) || undefined) : undefined;
@@ -1079,6 +1088,19 @@ export class BraveController {
         if (captchaInfo?.status === 'solved') {
           try { html = await page.content(); } catch (e) { if (killed) throw e; }
         }
+      }
+      // Átadott (reCAPTCHA/hCaptcha) challenge ítélete: átjutott, ha a C2
+      // megoldotta, vagy a lapon már nincs challenge-jel (a W2 widget_solved-
+      // szabályával egy szellemben: megoldott widget = átjutott, a tartalom-
+      // értékelő mondja meg, használható-e).
+      if (challengeInfo?.handoff) {
+        if (killed) throw BraveController._pageDeadlineError('page');
+        const still = detectChallengeHtml(html);
+        challengeInfo.passed = captchaInfo?.status === 'solved' || !still;
+        if (!challengeInfo.passed && still && still.type !== challengeInfo.type) challengeInfo.final_type = still.type;
+        cfStatus = challengeInfo.passed ? 'cleared_attempt_1' : 'blocked';
+        console.log(`[challenge] ${challengeInfo.type} host=${hostOnly(url)} passed=${challengeInfo.passed} (C2: ${captchaInfo?.status || 'nincs felismert CAPTCHA'})`);
+        if (challengeInfo.passed) await this._saveClearance(page, url);
       }
 
       // Cookie-jar save — csak stealth módban, ha bármi clearance cookie
@@ -2841,6 +2863,13 @@ export class BraveController {
         web_security: !/^(1|true|on|yes)$/i.test(String(process.env.BRAVE_DISABLE_WEB_SECURITY || '').trim()),
       },
       captcha_solver: captchaSolverHealth(),
+      // 2026-10-08 (rel-wall): az egyszeri purpose:"read" brave_page CAPTCHA-
+      // plafonja (READ_CHALLENGE_TIMEOUT_MS) — aktív, ha a C2 megoldó be van kapcsolva.
+      read_challenge_timeout: {
+        active: captchaSolverEnabled(),
+        ms: readChallengeCeilingMs(),
+        base_ms: toolTimeoutMs('brave_page', {}),
+      },
     };
   }
 

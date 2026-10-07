@@ -41,14 +41,30 @@ test('⛔ HATÁR: csak purpose="read" mellett fut szolgáltató — minden más 
   } finally { off(); }
 });
 
-test('⛔ HATÁR (szerkezeti): a brave_page / interact kód nem éri el a megoldót és a challenge-kattintást', () => {
+// 2026-10-08 (rel-wall, koordinátori döntés): a C2 szabálya él — a saját megoldó
+// az EGYSZERI `purpose:"read"` brave_page-hívásban futhat (az engine fetch
+// Chrome-foka), munkamenetben SOHA. A W2 challenge-kezelője és szolgáltató-lánca
+// a brave_page-ből továbbra sem érhető el.
+test('⛔ HATÁR (szerkezeti): a brave_page a W2 challenge-kezelőt nem éri el; a C2 megoldót CSAK az egyszeri read-ágban, munkamenet-őr mögött', () => {
   const page = fs.readFileSync(path.join(ROOT, 'src', 'brave-page.js'), 'utf8');
-  assert.ok(!/captcha\//.test(page) && !/challenge\.js/.test(page) && !/solveCaptcha/.test(page));
-  // a scrape-út a challenge-kezelőt MINDIG purpose:'read'-del hívja
+  assert.ok(!/challenge\.js/.test(page) && !/solveCaptcha/.test(page) && !/captcha\/provider/.test(page));
+  const imports = (page.match(/from '\.\/captcha\/[^']+'/g) || []).sort();
+  assert.deepEqual(imports, ["from './captcha/pointer.js'", "from './captcha/read-path.js'"]);
+  // pontosan EGY megoldó-hívás, a `purpose === 'read'` ágban, a `sid || keep` őr UTÁN
+  assert.equal((page.match(/solveOnReadPath\(/g) || []).length, 1);
+  const at = page.indexOf('solveOnReadPath(page');
+  const branch = page.indexOf("if (args.purpose === 'read') {");
+  assert.ok(branch > 0 && branch < at);
+  assert.match(page.slice(branch, at), /if \(sid \|\| keep\) \{\s*warn\('captcha_solver_skipped: session path/);
+  assert.match(page.slice(at, at + 80), /purpose: 'read'/);
+  // a scrape-út a challenge-kezelőt és a megoldót MINDIG purpose:'read'-del hívja
   const ctl = fs.readFileSync(path.join(ROOT, 'src', 'brave-controller.js'), 'utf8');
   const calls = ctl.match(/handleChallenge\(page[\s\S]{0,600}?\}\);/g) || [];
   assert.ok(calls.length >= 1);
   for (const c of calls) assert.match(c, /purpose: 'read'/);
+  const solves = ctl.match(/solveOnReadPath\(page[^)]*\)/g) || [];
+  assert.ok(solves.length >= 1);
+  for (const c of solves) assert.match(c, /purpose: 'read'/);
   assert.ok(!/solveCaptcha/.test(ctl));
 });
 

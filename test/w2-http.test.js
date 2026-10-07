@@ -83,6 +83,8 @@ test('HTTP: /health alapállapot — challenge-kivárás BE, solve KI, humanize 
   assert.equal(h.captcha_solver.purpose_gate, 'read');
   assert.match(h.stealth_net.webrtc, /disable_non_proxied_udp/);
   assert.equal(h.stealth_net.web_security, true);
+  // rel-wall: a read-CAPTCHA-plafon látszik; C2 nélkül inaktív
+  assert.deepEqual(h.read_challenge_timeout, { active: false, ms: 60000, base_ms: 25000 });
   // a brave_scrape MCP-válasza: challenge-mező
   const r = await srv.scrape({ url: `${fx.base}/cf?d=1500`, waitUntil: 'domcontentloaded' });
   assert.equal(r.challenge?.type, 'cloudflare_interstitial', JSON.stringify(r).slice(0, 300));
@@ -100,7 +102,9 @@ test('HTTP: kulccsal aktív megoldó + flagek — a kulcs sem a /health-ben, sem
   assert.equal(h.captcha_solver.active, true);
   assert.deepEqual(h.captcha_solver.order, ['capsolver', 'echolot']);
   assert.equal(h.captcha_solver.providers[0].active, true);
-  assert.equal(h.captcha_solver.providers[1].registered, false);   // a másik sáv modulja még nincs meg
+  // a C2 „echolot" szolgáltatója (rel-wall óta) megvan és regisztrált; engine-URL nélkül inaktív
+  assert.deepEqual([h.captcha_solver.providers[1].registered, h.captcha_solver.providers[1].active,
+    h.captcha_solver.providers[1].reason], [true, false, 'CAPTCHA_ENGINE_URL not set']);
   assert.equal(h.challenge.solve, true);
   assert.equal(h.humanize.enabled, true);
   assert.equal(h.stealth_net.webrtc, 'disable_non_proxied_udp');

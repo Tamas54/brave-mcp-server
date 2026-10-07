@@ -452,7 +452,7 @@ export const tools = [
         block_ads: { type: 'boolean', description: 'Reklám/tracker hostok blokkolása (default true)' },
         wait_ms: { type: 'number', description: 'Várakozás a betöltés után (ms, default 0)' },
         purpose: { type: 'string', enum: ['read'], description: '"read": egyszeri olvasó hívás — a nyitó CAPTCHA-falat a saját megoldó átlépi (ha a szerveren be van kapcsolva); munkamenetben hatástalan' },
-        timeout_ms: { type: 'number', description: 'Hívás-határidő (ms, max 25000)' },
+        timeout_ms: { type: 'number', description: 'Hívás-határidő (ms, max 25000; egyszeri purpose:"read" + CAPTCHA: max 60000)' },
         profile: {
           type: 'object',
           description: 'Böngésző-profil: az azonos nevűek közös sütit/localStorage-t kapnak',

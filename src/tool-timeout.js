@@ -8,15 +8,49 @@
 // Mostantól: alapértelmezés marad 25 s, de a hosszú utak saját plafont kapnak.
 // Minden érték env-ből felülírható; a függvény TISZTA (tesztelhető).
 
+import { solverEnabled as captchaSolverEnabled } from './captcha/read-path.js';
+
 const envInt = (env, k, d) => {
   const v = parseInt(env?.[k] ?? '', 10);
   return Number.isFinite(v) && v > 0 ? v : d;
 };
 
+// ════════════════════════════════════════════════════════════════════
+//  Olvasási CAPTCHA/challenge-plafon — 2026-10-08 (rel-wall, W2+C2)
+// ════════════════════════════════════════════════════════════════════
+// MIÉRT: a valódi reCAPTCHA-n a 25 s-os hívás-keretbe kb. EGY megoldási kör
+// fér. Koordinátori döntés: a TOOL_CALL_TIMEOUT_MS alapértéke marad, de az
+// EGYSZERI (munkamenet nélküli) `purpose:"read"` brave_page-hívás — az engine
+// fetch Chrome-foka — magasabb plafont kap: READ_CHALLENGE_TIMEOUT_MS (alap
+// 60 000). A 25 s fölötti részt a brave_page CSAK akkor használja, ha a lapon
+// ténylegesen CAPTCHA-t kezel (src/brave-page.js run()), és ezt a válaszban
+// kimondja (`read_challenge_timeout`). Munkamenetes hívás (session_id /
+// keep_session) SOHA nem kapja (ott a megoldó sem fut).
+// Sosem rövidebb az alapnál.
+export function readChallengeCeilingMs(env = process.env) {
+  const base = envInt(env, 'TOOL_CALL_TIMEOUT_MS', 25000);
+  return Math.max(base, envInt(env, 'READ_CHALLENGE_TIMEOUT_MS', 60000));
+}
+
+// Egyszeri olvasó brave_page-hívás? (Ugyanaz a szabály, mint a brave-page.js
+// run()-jában: session_id NINCS, és keep_session nincs — vagy close-zal jön.)
+export function isOneShotRead(args) {
+  const a = (args && typeof args === 'object') ? args : {};
+  if (a.purpose !== 'read') return false;
+  if (typeof a.session_id === 'string' && a.session_id) return false;
+  if (a.keep_session && !a.close) return false;
+  return true;
+}
+
 // A hívás határideje ms-ban az adott toolra és argumentumokra.
 export function toolTimeoutMs(toolName, args, env = process.env) {
   const base = envInt(env, 'TOOL_CALL_TIMEOUT_MS', 25000);
   const a = (args && typeof args === 'object') ? args : {};
+  if (toolName === 'brave_page' && isOneShotRead(a) && captchaSolverEnabled(env)) {
+    // A külső (HTTP /mcp) vágás itt a magasabb plafon — a hívás belső
+    // határideje ettől még a régi, amíg CAPTCHA-t nem kezel.
+    return readChallengeCeilingMs(env);
+  }
   if (toolName === 'brave_scrape' && (a.flaresolverr === true || a.auto_fallback === true)) {
     // A lánc worst-case ~150 s + tartalék. Sosem rövidebb az alapnál.
     return Math.max(base, envInt(env, 'TOOL_TIMEOUT_SCRAPE_SLOW_MS', 160000));

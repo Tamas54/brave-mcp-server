@@ -20,6 +20,14 @@
 //    kontextust); a hívás a meglévő ScrapeGate-permitet kéri, és a 25 s-os
 //    TOOL_CALL_TIMEOUT alatt SAJÁT határidővel ér véget (részleges eredmény +
 //    warning, nem a külső 504).
+//    Kivétel (2026-10-08, rel-wall): az EGYSZERI `purpose:"read"` hívás, ha a
+//    lapon CAPTCHA-t kezel, a READ_CHALLENGE_TIMEOUT_MS plafonig (alap 60 s)
+//    nyújthatja a határidőt — ezt a válasz `read_challenge_timeout` mezője és egy
+//    warning kimondja. A navigáció és minden más lépés a régi keretben marad.
+//  * CAPTCHA (koordinátori szabály): a C2 saját megoldója CSAK az egyszeri
+//    `purpose:"read"` hívásban fut (az engine fetch Chrome-foka); munkamenetes
+//    hívásban (session_id / keep_session — interact/goal, űrlapok) SOHA. A W2
+//    challenge-kezelője (kivárás, checkbox-kattintás) itt nem fut.
 //  * Napló: sosem írunk ki beírt szöveget, scriptet, teljes URL-t, session-id-t.
 
 import crypto from 'node:crypto';
@@ -27,16 +35,18 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { BLOCK_HEADER } from './egress.js';
 // 2026-10-07 (W2): HUMANIZE=1 → kattintás/gépelés a munkamenet „kezén" (egérpálya,
-// gombnyomás-dwell, gépelési ritmus). CAPTCHA-megoldó / challenge-kattintás ITT
-// SOHA (koordinátori határ: a megoldó csak olvasási úton fut).
+// gombnyomás-dwell, gépelési ritmus). A W2 challenge-kattintása itt SOHA; a C2
+// CAPTCHA-megoldó CSAK az egyszeri `purpose:"read"` hívásban (olvasási út, az
+// engine fetch Chrome-foka) — munkamenetben SOHA (koordinátori döntés, 2026-10-08).
 import { humanizeEnabled } from './stealth/humanize.js';
 import {
   diagnoseInPage, nextMove, diagnoseSelector, isBadSelectorError, fieldStateInPage, keptVerdict,
   describeInPage, NEXT_MOVE,
 } from './action-diagnose.js';
 // C2 (2026-10-07): a CAPTCHA-megoldó CSAK az egyszeri `purpose:"read"`-es hívásban (lásd run())
-import { solveOnReadPath } from './captcha/read-path.js';
+import { solveOnReadPath, solverEnabled as captchaSolverEnabled } from './captcha/read-path.js';
 import { fromHumanInput } from './captcha/pointer.js';
+import { readChallengeCeilingMs } from './tool-timeout.js';
 
 const envInt = (k, d) => {
   const v = parseInt(process.env[k] ?? '', 10);
@@ -61,6 +71,8 @@ function limitsFromEnv() {
     maxScreenshotsPerCall: 6,
     maxPdfsPerCall: 3,
     toolTimeoutMs: envInt('TOOL_CALL_TIMEOUT_MS', 25000),
+    // 2026-10-08: az egyszeri purpose:"read" hívás CAPTCHA-plafonja (tool-timeout.js)
+    readChallengeTimeoutMs: readChallengeCeilingMs(process.env),
     sweepIntervalMs: envInt('BRAVE_PAGE_SWEEP_INTERVAL_MS', 15000),
   };
 }
@@ -1215,7 +1227,14 @@ export class PageSessionManager {
     args = args && typeof args === 'object' ? args : {};
     const reqTimeout = clampInt(args.timeout_ms, 1000, L.toolTimeoutMs, L.toolTimeoutMs);
     // A külső TOOL_CALL_TIMEOUT alatt SAJÁT határidő (részleges eredmény > 504).
-    const deadline = t0 + Math.min(reqTimeout, L.toolTimeoutMs - 1200);
+    // (let: az egyszeri read-hívás CAPTCHA-kezelés után kinyújthatja, lásd lent.)
+    let deadline = t0 + Math.min(reqTimeout, L.toolTimeoutMs - 1200);
+    // 2026-10-08 (rel-wall): az egyszeri purpose:"read" hívás CAPTCHA-határideje.
+    // A plafon READ_CHALLENGE_TIMEOUT_MS (alap 60 s, a külső /mcp-vágás is ez —
+    // tool-timeout.js); a hívó timeout_ms-e itt is köt (max a plafon). CSAK akkor
+    // lép életbe, ha a lapon a C2 ténylegesen CAPTCHA-t kezel.
+    const readCeil = Math.max(L.toolTimeoutMs, L.readChallengeTimeoutMs || 0);
+    const captchaDeadline = t0 + Math.min(clampInt(args.timeout_ms, 1000, readCeil, readCeil), readCeil - 1200);
     const out = {
       ok: false, session_id: null,
       url: typeof args.url === 'string' ? args.url : null,
@@ -1225,7 +1244,12 @@ export class PageSessionManager {
       error: null,
     };
     const warn = (w) => { if (out.warnings.length < 100) out.warnings.push(String(w)); };
-    const finish = () => { out.elapsed_ms = Date.now() - t0; return out; };
+    const finish = () => {
+      out.elapsed_ms = Date.now() - t0;
+      // a magasabb plafonból ténylegesen felhasznált rész (0 = belefért az alapba)
+      if (out.read_challenge_timeout) out.read_challenge_timeout.beyond_base_ms = Math.max(0, out.elapsed_ms - out.read_challenge_timeout.base_deadline_ms);
+      return out;
+    };
     const fail = (err) => { out.error = err; return finish(); };
 
     const sid = typeof args.session_id === 'string' && args.session_id ? args.session_id : null;
@@ -1350,15 +1374,36 @@ export class PageSessionManager {
           warn('captcha_solver_skipped: session path (purpose "read" only applies to one-shot calls)');
         } else if (navOk && !out.blocked) {
           let cap = null;
+          // Magasabb plafon (READ_CHALLENGE_TIMEOUT_MS): a megoldó a kinyújtott
+          // határidőig dolgozhat, de a FELISMERÉS a régi keretben marad — CAPTCHA
+          // nélküli lapon a hívás így nem nyúlik meg.
+          const baseDeadline = deadline;
+          const ext = captchaSolverEnabled() && captchaDeadline > deadline;
+          const capEnd = (ext ? captchaDeadline : deadline) - reserveMs - 300;
           try {
             const human = typeof this.c?._humanInput === 'function' ? (fromHumanInput(this.c._humanInput()) || undefined) : undefined;
-            cap = await solveOnReadPath(page, { purpose: 'read', deadlineTs: deadline - reserveMs - 300, human });
+            const extOpts = ext ? {
+              detectWaitMs: Math.max(0, Math.min(envInt('CAPTCHA_DETECT_WAIT_MS', 2500), deadline - reserveMs - 300 - Date.now() - 1000)),
+              budgetMs: Math.max(1, capEnd - Date.now()),
+            } : {};
+            cap = await solveOnReadPath(page, { purpose: 'read', deadlineTs: capEnd, human, ...extOpts });
           } catch (e) {
             cap = { status: 'failed', error: `internal:${String(e?.message || e).split('\n')[0].slice(0, 80)}` };
           }
           if (cap) {
             out.captcha = cap;
             warn(`captcha_${cap.status}:${cap.vendor || '?'}:${cap.kind || '?'}${cap.reason ? `:${cap.reason}` : ''}${cap.error ? `:${cap.error}` : ''}`);
+            // Kezelt CAPTCHA (megoldva / kudarc), vagy a kezelés átlógott a régi
+            // határidőn → a hívás hátralévő része (formátumok, zárás) is a
+            // kinyújtott határidőből él, és a válasz ezt kimondja.
+            if (ext && (cap.status !== 'skipped' || Date.now() > baseDeadline)) {
+              deadline = captchaDeadline;
+              out.read_challenge_timeout = {
+                used: true, env: 'READ_CHALLENGE_TIMEOUT_MS', ceiling_ms: readCeil,
+                deadline_ms: captchaDeadline - t0, base_deadline_ms: baseDeadline - t0,
+              };
+              warn(`read_challenge_timeout_used: deadline ${captchaDeadline - t0}ms (READ_CHALLENGE_TIMEOUT_MS=${readCeil}, base ${baseDeadline - t0}ms)`);
+            }
           }
           if (cur.mainBlocked && !out.blocked) { out.blocked = { reason: cur.mainBlocked }; navOk = false; out.error = 'egress_blocked'; }
           const bad = await this._schemeGuard(s).catch(() => null);

@@ -501,9 +501,12 @@ export async function startCaptchaFixtures() {
       const mode = u.searchParams.get('mode') || 'static';
       st.rc.set(sid, { mode, extraRounds: mode === 'reload' ? 1 : Number(u.searchParams.get('extra') || 0) });
       const amode = u.searchParams.get('mode') === 'pass' ? 'pass' : 'x';
+      // ?sitekey=1 (rel-wall): a valódi lapok widget-tárolója data-sitekey-t is
+      // visel → a W2 felismerője is „recaptcha_gate"-nek látja (átfedés-teszt)
+      const sk = u.searchParams.get('sitekey') ? ' data-sitekey="6LcFixtureSiteKey000000000000000000000000"' : '';
       return html(res, `<!doctype html><title>Just a moment</title><h1>Please verify you are human</h1>
         <form id="f" action="/rc-pass" method="POST">
-          <div class="g-recaptcha"><iframe id="anchor" title="reCAPTCHA" src="${B2}/recaptcha/api2/anchor?ar=1&k=test&sid=${sid}&mode=${amode}" width="304" height="78" style="border:0"></iframe></div>
+          <div class="g-recaptcha"${sk}><iframe id="anchor" title="reCAPTCHA" src="${B2}/recaptcha/api2/anchor?ar=1&k=test&sid=${sid}&mode=${amode}" width="304" height="78" style="border:0"></iframe></div>
           <textarea id="g-recaptcha-response" name="g-recaptcha-response" style="display:none"></textarea>
           <button type="submit" id="go">Continue</button>
         </form>
@@ -521,9 +524,10 @@ export async function startCaptchaFixtures() {
       const sid = rid();
       st.hc.set(sid, { mode: u.searchParams.get('mode') || 'grid' });
       const fr = (f) => `${B2}/hcaptcha/captcha/v1/abc123/static/hcaptcha.html#frame=${f}&id=w1&sid=${sid}`;
+      const sk = u.searchParams.get('sitekey') ? ' data-sitekey="10000000-ffff-ffff-ffff-000000000001"' : '';
       return html(res, `<!doctype html><title>Verify</title><h1>One more step</h1>
         <form action="/hc-pass" method="POST"><input class="textinput" name="email" type="text" tabindex="-1" aria-hidden="true">
-          <div class="h-captcha"><iframe title="Widget containing checkbox for hCaptcha security challenge" src="${fr('checkbox')}" width="302" height="78" style="border:0"></iframe></div>
+          <div class="h-captcha"${sk}><iframe title="Widget containing checkbox for hCaptcha security challenge" src="${fr('checkbox')}" width="302" height="78" style="border:0"></iframe></div>
           <textarea name="h-captcha-response" style="display:none"></textarea><input type="submit" value="Submit"></form>
         <div id="hwrap" style="visibility:hidden;position:absolute;left:30px;top:110px;z-index:2000;background:#fff;box-shadow:0 0 4px #888">
           <iframe id="hch" title="Main content of the hCaptcha challenge" src="${fr('challenge')}" width="520" height="560" style="border:0"></iframe></div>

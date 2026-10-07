@@ -21,7 +21,11 @@
 // sütik szűrése.
 //
 // ⛔ HATÁR: kattintás és megoldó CSAK `purpose === 'read'` mellett (scrape /
-// crawl). A brave_page-munkamenetek ezt a modult nem hívják.
+// crawl). A brave_page ezt a modult nem hívja (a C2 saját megoldója az egyszeri
+// `purpose:"read"` brave_page-hívásban a captcha/read-path.js-en át fut —
+// munkamenetben soha).
+// 2026-10-08 (rel-wall): reCAPTCHA v2 / hCaptcha + engedélyezett C2 → a W2 nem
+// kattint, azonnal átad (captchaHandoff, SOLVER_HANDOFF_TYPES).
 
 import { solveCaptcha, captchaSolverHealth } from './captcha/provider.js';
 
@@ -146,6 +150,20 @@ export function detectChallengeHtml(html) {
 const AUTO_PASS_TYPES = new Set(['cloudflare_interstitial', 'datadome_interstitial', 'imperva_interstitial', 'akamai_challenge']);
 // Mely challenge-eken van értelme a checkbox-kattintásnak.
 const CHECKBOX_TYPES = new Set(['cloudflare_interstitial', 'turnstile_gate', 'recaptcha_gate', 'hcaptcha_gate']);
+
+// ─── Átadás a C2 saját megoldójának — 2026-10-08 (rel-wall) ─────────────
+// Koordinátori döntés: reCAPTCHA v2 és hCaptcha típusnál, ha a C2 megoldó
+// engedélyezett (CAPTCHA_SOLVER_ENABLED) ÉS az út olvasási, a W2 NEM kattint a
+// jelölőnégyzetre és NEM várja ki a 15 s-os keretet (az a C2 idejét enné meg),
+// hanem azonnal átadja a vezérlést a src/captcha/read-path.js
+// solveOnReadPath-jának (a hívó futtatja, lásd brave-controller _scrapeOnce).
+// A Cloudflare/Turnstile és a többi interstitial a W2-é marad. Kikapcsolt C2
+// mellett a W2 régi viselkedése él (CHALLENGE_SOLVE=1 → checkbox-kattintás).
+export const SOLVER_HANDOFF_TYPES = new Set(['recaptcha_gate', 'hcaptcha_gate']);
+
+export function captchaHandoff(det, { solverEnabled = false, purpose } = {}) {
+  return !!(det && solverEnabled && purpose === 'read' && SOLVER_HANDOFF_TYPES.has(det.type));
+}
 
 // ─── Checkbox keresése (keretek + tartalék szelektorok) ─────────────────
 const TURNSTILE_FRAME_RE = /\/cdn-cgi\/challenge-platform\/[^?#]*turnstile|^https?:\/\/challenges\.cloudflare\.com\/cdn-cgi\/challenge-platform\//i;
@@ -334,20 +352,28 @@ async function readHtml(page) {
 // ─── Kivárás + (flag mögött) megoldás ───────────────────────────────────
 // first: a detectChallengeHtml eredménye a betöltött lapon.
 // opts: { waitMs, interactiveWaitMs, pollMs, deadlineTs, solve, purpose, human,
-//         humanizeIdle, busy?() → bool, busyWaitMs, env }
+//         humanizeIdle, busy?() → bool, busyWaitMs, env,
+//         captchaHandoff?: bool — a C2 megoldó engedélyezett (lásd captchaHandoff()) }
 // Vissza: { info: {type, vendor, interactive, waited_ms, passed, navigations,
 //           blocked?, final_type?, cut?: 'deadline'|'busy', widget_solved?, solve?,
-//           solver?}, html }
+//           solver?, handoff?: 'captcha_solver'}, html }
+// handoff: a W2 nem nyúlt a widgethez — az átjutásról a hívó dönt a C2 után.
 export async function handleChallenge(page, first, opts = {}) {
   const t0 = Date.now();
   const env = opts.env || process.env;
   const readPath = opts.purpose === 'read';
   const solveOn = !!opts.solve && readPath && !!opts.human;
   const solverHealth = readPath ? captchaSolverHealth(env) : { active: false };
+  const handoff = (d) => captchaHandoff(d, { solverEnabled: !!opts.captchaHandoff, purpose: opts.purpose });
   const info = { type: first.type, vendor: first.vendor, interactive: !!first.interactive, waited_ms: 0, passed: false, navigations: 0 };
   if (first.ctype) info.ctype = first.ctype;
   if (first.block) {
     info.blocked = true;
+    return { info, html: null };
+  }
+  // reCAPTCHA v2 / hCaptcha + aktív C2: azonnali átadás (0 ms, kattintás nélkül).
+  if (handoff(first)) {
+    info.handoff = 'captcha_solver';
     return { info, html: null };
   }
   // Teljes keret: ami magától is továbbengedhet (a CF „managed" is gyakran
@@ -388,6 +414,9 @@ export async function handleChallenge(page, first, opts = {}) {
       if (!cur) { info.passed = true; break; }
       if (cur.block) { info.blocked = true; info.final_type = cur.type; break; }
       if (cur.type !== first.type) info.final_type = cur.type;
+      // A kivárás közben reCAPTCHA/hCaptcha-kapuvá vált (pl. interstitial után):
+      // innen a C2-é — a W2 itt sem kattint, és nem égeti tovább a keretet.
+      if (handoff(cur)) { info.handoff = 'captcha_solver'; break; }
       const elapsed = Date.now() - t0;
 
       // Emberi „fészkelődés" a várakozás alatt (HUMANIZE=1).

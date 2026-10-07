@@ -27,3 +27,27 @@ test('env-felülírás', () => {
   assert.equal(toolTimeoutMs('brave_page', {}, { TOOL_CALL_TIMEOUT_MS: 'abc' }), 25000);
   assert.equal(toolTimeoutMs('brave_page', {}, { TOOL_CALL_TIMEOUT_MS: '-5' }), 25000);
 });
+
+// 2026-10-08 (rel-wall): az egyszeri purpose:"read" brave_page CAPTCHA-plafonja.
+test('READ_CHALLENGE_TIMEOUT_MS: csak egyszeri purpose:"read" brave_page + bekapcsolt C2 → 60 s; minden más az alap', async () => {
+  const { readChallengeCeilingMs, isOneShotRead } = await import('../src/tool-timeout.js');
+  const on = { CAPTCHA_SOLVER_ENABLED: '1' };
+  assert.equal(toolTimeoutMs('brave_page', { url: 'https://x', purpose: 'read' }, on), 60000);
+  // close-zal érkező keep_session = egyszeri hívás
+  assert.equal(toolTimeoutMs('brave_page', { url: 'https://x', purpose: 'read', keep_session: true, close: true }, on), 60000);
+  // munkamenet: SOHA (ott a megoldó sem fut)
+  assert.equal(toolTimeoutMs('brave_page', { session_id: 'abc', purpose: 'read' }, on), 25000);
+  assert.equal(toolTimeoutMs('brave_page', { url: 'https://x', purpose: 'read', keep_session: true }, on), 25000);
+  // purpose nélkül / más purpose / kikapcsolt megoldó / más tool: alap
+  assert.equal(toolTimeoutMs('brave_page', { url: 'https://x' }, on), 25000);
+  assert.equal(toolTimeoutMs('brave_page', { url: 'https://x', purpose: 'interact' }, on), 25000);
+  assert.equal(toolTimeoutMs('brave_page', { url: 'https://x', purpose: 'read' }, {}), 25000);
+  assert.equal(toolTimeoutMs('brave_scrape', { url: 'https://x', purpose: 'read' }, on), 25000);
+  // env-felülírás; sosem rövidebb az alapnál
+  assert.equal(toolTimeoutMs('brave_page', { purpose: 'read', url: 'x' }, { ...on, READ_CHALLENGE_TIMEOUT_MS: '90000' }), 90000);
+  assert.equal(toolTimeoutMs('brave_page', { purpose: 'read', url: 'x' }, { ...on, READ_CHALLENGE_TIMEOUT_MS: '5000' }), 25000);
+  assert.equal(readChallengeCeilingMs({ TOOL_CALL_TIMEOUT_MS: '70000' }), 70000);
+  assert.equal(readChallengeCeilingMs({ READ_CHALLENGE_TIMEOUT_MS: 'abc' }), 60000);
+  assert.equal(isOneShotRead({ purpose: 'read', session_id: '' }), true);
+  assert.equal(isOneShotRead(null), false);
+});

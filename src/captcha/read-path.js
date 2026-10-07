@@ -23,7 +23,9 @@
 //   CAPTCHA_SOLVER_ENABLED        1/true = be (alap: KI)
 //   CAPTCHA_SOLVER_PROVIDER       a kép → válasz háttere (lásd backendsFor): üres/„echolot" = a saját
 //                                 végpont; „echolot,capsolver" = szövegnél fizetős második sor (W2)
-//   CAPTCHA_SOLVE_BUDGET_MS       egy megoldás plafonja (alap 20000; a hívó határideje alatt)
+//   CAPTCHA_SOLVE_BUDGET_MS       egy megoldás plafonja (alap 20000; a hívó határideje alatt) —
+//                                 a brave_page egyszeri read-hívásában a READ_CHALLENGE_TIMEOUT_MS-
+//                                 ből számolt keret írja felül (budgetMs, lásd tool-timeout.js)
 //   CAPTCHA_MIN_BUDGET_MS         ennél kevesebb hátralévő időnél nem kezdünk bele (alap 5000)
 //   CAPTCHA_DETECT_WAIT_MS        a widget-keret betöltésére várás (alap 2500)
 //   CAPTCHA_MAX_SOLVES_PER_HOUR   óránkénti megoldás-kísérlet plafon (alap 30)
@@ -161,11 +163,15 @@ async function submitWall(page, det, deadlineTs, human, navCount) {
 // kapcsolva (a hívó útja változatlan); különben a telemetria-objektum:
 //   {status: 'solved'|'failed'|'skipped', vendor, kind, reason?, provider?, rounds?,
 //    solver_calls?, ms, cost_usd?, error?, submit?}
-export async function solveOnReadPath(page, { purpose, deadlineTs, env = process.env, human, solver, detectWaitMs, op = 'scrape' } = {}) {
+// budgetMs (2026-10-08, rel-wall): a CAPTCHA_SOLVE_BUDGET_MS felülírása — a
+// brave_page egyszeri read-hívása a READ_CHALLENGE_TIMEOUT_MS-plafonnal adja (a
+// kiterjesztett keretben több kör is férjen); a határidő (deadlineTs) így is köt.
+export async function solveOnReadPath(page, { purpose, deadlineTs, env = process.env, human, solver, detectWaitMs, budgetMs, op = 'scrape' } = {}) {
   if (purpose !== 'read') return { status: 'skipped', reason: 'purpose_not_read' };
   if (!solverEnabled(env)) return null;
   const t0 = Date.now();
-  const end = Math.min(deadlineTs || (t0 + 20000), t0 + envNum(env, 'CAPTCHA_SOLVE_BUDGET_MS', 20000));
+  const budget = Number.isFinite(budgetMs) && budgetMs > 0 ? budgetMs : envNum(env, 'CAPTCHA_SOLVE_BUDGET_MS', 20000);
+  const end = Math.min(deadlineTs || (t0 + 20000), t0 + budget);
   const dWait = Math.max(0, Math.min(detectWaitMs ?? envNum(env, 'CAPTCHA_DETECT_WAIT_MS', 2500), end - Date.now() - 1000));
   let det;
   try {
