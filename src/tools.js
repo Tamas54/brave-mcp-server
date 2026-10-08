@@ -393,7 +393,7 @@ export const tools = [
     name: 'brave_page',
     title: 'Izolált böngésző-lap lépésekkel',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-    description: 'Izolált böngésző-lap (saját inkognitó kontextus) Firecrawl-nevű actionökkel: wait, click (selector/text/x,y), write, press, scroll, screenshot, scrape, executeJavascript (CSAK a lapban), generatePDF, navigate; + select (opció value/felirat), clear (billentyűzetes ürítés). Csak valódi (trusted) egér/billentyű; JS-fallback csak warningként (untrusted_*). Hibás lépésnél action_results[].why (matches, covered_by…) + next; write után kept (full/truncated/reformatted/emptied/focus_moved). Kimenet: html/text/links/screenshot (JPEG, ~1.5 MB). keep_session=true → session_id (tétlen TTL 300 s, abszolút 30 perc, max 4); profile → sütik+localStorage névvel. Csak http/https; belső címek tiltva (blocked.reason). Max ~25 s.',
+    description: 'Izolált böngésző-lap (saját inkognitó kontextus) Firecrawl-nevű actionökkel: wait, click (selector/text/x,y), write, press, scroll, screenshot, scrape, executeJavascript (CSAK a lapban), generatePDF, navigate; + select (opció value/felirat), clear (billentyűzetes ürítés). Csak valódi (trusted) egér/billentyű; JS-fallback csak warningként (untrusted_*). Hibás lépésnél action_results[].why (matches, covered_by…) + next; write után kept (full/truncated/reformatted/emptied/focus_moved). Kimenet: html/text/links/screenshot (JPEG, ~1.5 MB). keep_session=true → session_id (tétlen TTL 300 s, abszolút 30 perc, max 4); dialog=accept|dismiss (JS-dialógusok, default dismiss); profile → sütik+localStorage névvel. Csak http/https; belső címek tiltva (blocked.reason). Max ~25 s.',
     handler: 'tools/call',
     inputSchema: {
       type: 'object',
@@ -451,6 +451,7 @@ export const tools = [
         timezone: { type: 'string', description: 'pl. "Europe/Budapest"' },
         block_ads: { type: 'boolean', description: 'Reklám/tracker hostok blokkolása (default true)' },
         wait_ms: { type: 'number', description: 'Várakozás a betöltés után (ms, default 0)' },
+        dialog: { type: 'string', enum: ['accept', 'dismiss'], description: 'JS-dialógusok (alert/confirm/prompt) kezelése: "dismiss" (default) vagy "accept" (OK). A munkamenet megjegyzi. A kezelt dialógus a válasz dialogs-ában és az akció eredményében (dialogs) látszik' },
         purpose: { type: 'string', enum: ['read'], description: '"read": egyszeri olvasó hívás — a nyitó CAPTCHA-falat a saját megoldó átlépi (ha a szerveren be van kapcsolva); munkamenetben hatástalan' },
         timeout_ms: { type: 'number', description: 'Hívás-határidő (ms, max 25000; egyszeri purpose:"read" + CAPTCHA: max 60000)' },
         profile: {

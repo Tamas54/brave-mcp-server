@@ -65,7 +65,11 @@ function limitsFromEnv() {
     pdfMaxB64: envInt('BRAVE_PAGE_PDF_MAX_B64', 5000000),
     htmlMaxChars: envInt('BRAVE_PAGE_MAX_HTML_CHARS', 2000000),
     textMaxChars: envInt('BRAVE_PAGE_MAX_TEXT_CHARS', 500000),
-    jsResultMaxChars: envInt('BRAVE_PAGE_MAX_JS_RESULT_CHARS', 262144),
+    // G2 (2026-10-08, A1-mérés): 2 000 000 (volt 262 144) — az engine pillanatkép-szkriptje
+    // (snapshot.LIVE_JS) a HTML-t 800 000 jelre vágja, a JSON-escape legfeljebb ~kétszerez; a
+    // 262 144-es plafon minden nagy lap (KSH-táblák, nvidia.com) pillanatképét eldobta (a goal
+    // `snapshot_failed`-del bukott a 0. lépésnél). = htmlMaxChars: a html-formátum ennyit már ad.
+    jsResultMaxChars: envInt('BRAVE_PAGE_MAX_JS_RESULT_CHARS', 2000000),
     maxLinks: 2000,
     maxActions: 50,
     maxScreenshotsPerCall: 6,
@@ -374,10 +378,24 @@ export class PageSessionManager {
   // ── Lap-előkészítés (egyszer, a munkamenet létrejöttekor) ───────────
   async _setupPage(s, args, warn) {
     const page = s.page;
-    // Párbeszédablakok automatikus lezárása (különben az alert örökre fog).
+    // Párbeszédablakok automatikus kezelése (különben az alert örökre fog).
+    // G2 (2026-10-08, A1-mérés): a politika munkamenetenként állítható (`dialog`:
+    // 'accept' | 'dismiss', alap 'dismiss' — a régi viselkedés). Eddig MINDEN
+    // megerősítő dialógust elutasítottunk → a „JS Confirm → OK" típusú feladat
+    // elvben megoldhatatlan volt. A beforeunload mindig accept (különben a lap
+    // nem navigálhat el). A kezelt dialógus (típus, kezelés, az üzenet eleje)
+    // a hívás `dialogs`-ában és az azt kiváltó akció eredményében is látszik.
     page.on('dialog', (d) => {
-      s.cur?.dialogs.push(d.type());
-      (d.type() === 'beforeunload' ? d.accept() : d.dismiss()).catch(() => {});
+      let type = 'dialog';
+      try { type = String(d.type() || 'dialog'); } catch (_) {}
+      const action = (type === 'beforeunload' || s.dialogPolicy === 'accept') ? 'accept' : 'dismiss';
+      let message = '';
+      try { message = String(d.message() || '').slice(0, 200); } catch (_) {}
+      s.cur?.dialogs.push({ type, action, message });
+      // a prompt az ALAPÉRTÉKÉVEL fogadódik el (a puszta accept() üres szöveget adna)
+      let dflt;
+      try { dflt = type === 'prompt' ? String(d.defaultValue() ?? '') : undefined; } catch (_) { dflt = ''; }
+      (action === 'accept' ? d.accept(dflt) : d.dismiss()).catch(() => {});
     });
     // Egress-tiltás csatolása a hívás gyűjtőjéhez.
     page.on('requestfailed', (req) => {
@@ -1340,6 +1358,11 @@ export class PageSessionManager {
         }
       }
 
+      // G2: dialógus-politika (munkamenetenként megjegyezve; a hívás felülírhatja)
+      if (args.dialog !== undefined && args.dialog !== null) {
+        if (args.dialog === 'accept' || args.dialog === 'dismiss') s.dialogPolicy = args.dialog;
+        else warn(`dialog_policy_invalid: ${String(args.dialog).slice(0, 20)} (accept|dismiss)`);
+      }
       const cur = {
         t0, mainBlocked: null, subBlocked: new Map(), adsBlocked: 0, schemeBlocked: [],
         popups: [], dialogs: [], lastMainStatus: null, mainNavCount: 0,
@@ -1421,12 +1444,15 @@ export class PageSessionManager {
           continue;
         }
         let r;
+        const dialogsBefore = cur.dialogs.length;
         try {
           r = await this._runAction(s, a, deadline, reserveMs, warn, counters);
         } catch (e) {
           r = { type: String(a?.type || ''), ok: false, error: String(e?.message || e).split('\n')[0].slice(0, 200) };
           if (e instanceof BudgetError) r.error = 'deadline_exceeded';
         }
+        // G2: az akció közben felbukkant (és kezelt) dialógus az akció eredményében
+        if (cur.dialogs.length > dialogsBefore) r.dialogs = cur.dialogs.slice(dialogsBefore, dialogsBefore + 3);
         if (cur.mainBlocked && !out.blocked) {
           out.blocked = { reason: cur.mainBlocked };
           if (r.ok) { r.ok = false; r.error = 'egress_blocked'; }
@@ -1497,7 +1523,12 @@ export class PageSessionManager {
       if (cur.adsBlocked) warn(`block_ads: ${cur.adsBlocked} request(s) blocked`);
       if (cur.schemeBlocked.length) warn(`navigation_scheme_blocked: ${[...new Set(cur.schemeBlocked)].join(', ')}`);
       if (cur.popups.length) warn(`popup_closed: ${cur.popups.slice(0, 5).join(', ')}`);
-      if (cur.dialogs.length) warn(`dialog_dismissed: ${cur.dialogs.slice(0, 5).join(', ')}`);
+      if (cur.dialogs.length) {
+        const of = (act) => cur.dialogs.filter(d => d.action === act).slice(0, 5).map(d => d.type);
+        if (of('dismiss').length) warn(`dialog_dismissed: ${of('dismiss').join(', ')}`);
+        if (of('accept').length) warn(`dialog_accepted: ${of('accept').join(', ')}`);
+        out.dialogs = cur.dialogs.slice(0, 5);
+      }
       if (Date.now() > deadline) warn('deadline_exceeded: partial result');
 
       out.ok = !out.error && actionsOk && navOk && !out.blocked;
@@ -1559,7 +1590,7 @@ export class PageSessionManager {
       id, ctx, page: null, keep, busy: false,
       createdAt: Date.now(), lastUsed: Date.now(),
       profile: null, origins: new Map(), state: {}, viewport: { ...DESKTOP_VIEWPORT },
-      cur: null, cdp: null, intercepting: false,
+      cur: null, cdp: null, intercepting: false, dialogPolicy: 'dismiss',
     };
     try {
       if (args.profile !== undefined && args.profile !== null) {

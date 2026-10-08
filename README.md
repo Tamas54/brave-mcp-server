@@ -399,7 +399,9 @@ Mért többletidő (lokál, 7 valós oldal, medián): brave_scrape +~70 ms, brav
 
 Minden hívás (vagy munkamenet) saját inkognitó `BrowserContext`-ben fut: nem látja
 a scrape-sáv sütijeit, a `brave_login` munkameneteit, sem más munkamenetet.
-Letöltés tiltva, felugró ablak zárva, `alert/confirm` automatikusan lezárva.
+Letöltés tiltva, felugró ablak zárva, `alert/confirm/prompt` automatikusan kezelve:
+alapból elutasítva (`dialog: "dismiss"`), `dialog: "accept"`-tel elfogadva (a prompt az
+alapértékével) — a munkamenet megjegyzi; a `beforeunload` mindig elfogadva.
 A hívás a meglévő concurrency-limiten (`BRAVE_MAX_CONCURRENCY`) osztozik, és a
 25 s-os `TOOL_CALL_TIMEOUT_MS` alatt saját határidővel részleges eredményt ad.
 
@@ -423,6 +425,7 @@ A hívás a meglévő concurrency-limiten (`BRAVE_MAX_CONCURRENCY`) osztozik, é
   "formats": ["html", "text", "links", "screenshot"],
   "mobile": false, "locale": "hu-HU", "timezone": "Europe/Budapest",
   "headers": {"X-Foo": "bar"}, "block_ads": true, "wait_ms": 0, "timeout_ms": 25000,
+  "dialog": "dismiss",
   "profile": {"name": "owner:myprofile", "save_changes": true}
 }
 ```
@@ -436,10 +439,12 @@ Az első hibás action után a többi `skipped`.
 
 **Kimenet** (a tool `content[0].text` JSON-ja):
 `{ok, session_id, url, final_url, status, title, html, text, links, screenshot,
-action_results[{type, ok, error?, screenshot?, html?, url?, js_result?, js_type?, pdf?, clicked?, status?}],
-blocked: {reason}|null, warnings[], elapsed_ms, error}` — minden vágás/kizárás
-(pl. `screenshot_quality_reduced`, `html_truncated`, `block_ads: N request(s) blocked`,
-`egress_blocked_subresources`, `popup_closed`) a `warnings`-ban látszik.
+action_results[{type, ok, error?, screenshot?, html?, url?, js_result?, js_type?, pdf?, clicked?, status?, dialogs?}],
+blocked: {reason}|null, warnings[], elapsed_ms, error, dialogs?[{type, action, message}]}` —
+minden vágás/kizárás (pl. `screenshot_quality_reduced`, `html_truncated`, `block_ads: N
+request(s) blocked`, `egress_blocked_subresources`, `popup_closed`, `dialog_dismissed` /
+`dialog_accepted`, `js_result_dropped`) a `warnings`-ban látszik. A kezelt dialógus az azt
+kiváltó akció eredményében (`dialogs`) is ott van — típus, kezelés, az üzenet első 200 jele.
 
 **Munkamenetek:** `keep_session: true` → 128 bites `session_id`; tétlen TTL 300 s,
 abszolút 30 perc, egyszerre max `BRAVE_PAGE_MAX_SESSIONS` (4). A munkamenet a
@@ -461,6 +466,7 @@ fájlnév = a név SHA-256-ja), LRU max `BRAVE_PAGE_MAX_PROFILES` (50).
 | `BRAVE_PAGE_SCREENSHOT_MAX_B64` | `1500000` (JPEG; minőség-lépcső 80→60→40→25, majd kicsinyítés) |
 | `BRAVE_PAGE_FULLPAGE_MAX_HEIGHT` | `10000` px |
 | `BRAVE_PAGE_PDF_MAX_B64` / `BRAVE_PAGE_MAX_HTML_CHARS` | `5000000` / `2000000` |
+| `BRAVE_PAGE_MAX_JS_RESULT_CHARS` | `2000000` (JSON-hossz; fölötte `js_result: null` + `js_result_dropped`. 2026-10-08-ig 262144 — az engine pillanatképe 800 000 jelre vág) |
 
 **Tesztek:** `npm run test:node` (= `node --test test/`). A böngészős tesztek
 `BRAVE_PATH`-ot vagy egy telepített Chrome/Brave-et keresnek; a publikus részek
