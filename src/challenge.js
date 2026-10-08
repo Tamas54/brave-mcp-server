@@ -12,7 +12,7 @@
 //     (`#cf_turnstile div, #cf-turnstile div, .turnstile>div>div`,
 //     `.main-content p+div>div>div`), legfeljebb 3 próbálkozás.
 // A Scrapling neve promócióra nem használható (BSD-3, 3. pont). A teljes
-// licencszöveg a HELYI notices-fájlban (~/recon/tinyfish/THIRD_PARTY_NOTICES_bravemcp.md).
+// licencszöveg a repó THIRD_PARTY_NOTICES.md fájljában.
 //
 // Saját: a többi gyártó (DataDome, PerimeterX/HUMAN, Imperva, Akamai) jelölői,
 // a fal (block) ↔ kivárható challenge ↔ interaktív challenge szétválasztás, a

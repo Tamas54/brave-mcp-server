@@ -13,7 +13,7 @@
 //     határidők egy t0-tól, késésnél ELDOBÁS a „hatótávon" belül, sosem két
 //     esemény egy pillanatban) egyszerűsítve
 // A teljes licencszöveg és a forrásfájlok sha256-ja: a HELYI notices-fájlban
-// (~/recon/tinyfish/THIRD_PARTY_NOTICES_bravemcp.md) — a repóba notices nem kerül.
+// (THIRD_PARTY_NOTICES.md a repó gyökerében).
 //
 // Eltérések a forrástól: a Python random.Random helyett mulberry32 + Box–Muller
 // (a mag-reprodukálhatóság megmarad, a Python-kimenettel bitre NEM egyezik); a
