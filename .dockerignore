@@ -7,6 +7,7 @@ README.md
 Dockerfile
 .dockerignore
 *.md
+!THIRD_PARTY_NOTICES.md
 .sessions/
 .sessions-backup/
 test.js
